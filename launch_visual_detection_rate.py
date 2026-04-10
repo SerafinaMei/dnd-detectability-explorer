@@ -274,7 +274,7 @@ df, variant_master_df, summary_counts_df = load_data()
 # ------------------------------------------------
 st.title("DnD Gene Detectability Explorer")
 
-with st.expander("ℹ️ Information Manual & Glossary (Click to expand)"):
+with st.expander("ℹ️ Information Manual (Click to expand)"):
     st.markdown("""
     This dashboard filters candidate genes based on expression metrics, annotations, and overlapping sites between targetable variants and heterzygous regions.
     
