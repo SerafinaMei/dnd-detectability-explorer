@@ -31,11 +31,11 @@ st.markdown("""
 # -----------------------------------------------
 # File paths - adjust as needed for local testing
 # -----------------------------------------------
-CARDIAC_CSV = "detection_recheck_outputs/master_df_cardiac_qc3.csv"
-NEURON_CSV = "detection_recheck_outputs/master_df_neuron_qc3.csv"
-ANNOT_XLSX = "detection_recheck_outputs/genes_other_info.xlsx"
-VARIANT_FILE = "detection_recheck_outputs/FINAL_Combined_Master_Variant_Table.xlsx"
-SUMMARY_TSV = "detection_recheck_outputs/summary_counts.tsv" # Optional
+CARDIAC_CSV = "master_df_cardiac_qc3.csv"
+NEURON_CSV = "master_df_neuron_qc3.csv"
+ANNOT_XLSX = "genes_other_info.xlsx"
+VARIANT_FILE = "FINAL_Combined_Master_Variant_Table.xlsx"
+SUMMARY_TSV = "summary_counts.tsv" # Optional
 
 ANNOT_SHEET = 0
 
