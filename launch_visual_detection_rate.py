@@ -22,7 +22,7 @@ st.markdown("""
     [data-testid="stDataFrame"] [role="columnheader"] {
         font-weight: 700 !important;
         background-color: #f0f2f6 !important;
-    }
+    }R
 
     [data-testid="stDataFrame"] [role="rowheader"] {
         font-weight: 700 !important;
@@ -57,8 +57,8 @@ ANNOT_XLSX = "data/genes_other_info.xlsx"
 VARIANT_FILE = "data/FINAL_Combined_Master_Variant_Table.xlsx"
 SUMMARY_TSV = "data/summary_counts.tsv" # Optional
 EPI_PROM_GENE_CSV = "data/epi_silenceable_100_200_prom.csv"
-EPI_PROM_SITE_PKL = "detection_recheck_outputs/data/epi_silenceable_100_200_sites.pkl"
-
+EPI_PROM_SITE_PKL = "data/epi_silenceable_100_200_sites.pkl"
+CLINGEN_DOSAGE_CSV = "data/Clingen-Curation-Summary.csv"
 
 ANNOT_SHEET = 0
 
@@ -136,6 +136,101 @@ def load_optional_summary(summary_path: str) -> pd.DataFrame:
         return pd.read_csv(p, sep="\t")
     except Exception:
         return pd.DataFrame()
+
+def parse_clingen_score(assertion_value) -> float:
+    if pd.isna(assertion_value):
+        return pd.NA
+
+    text = str(assertion_value).strip()
+    if not text:
+        return pd.NA
+
+    prefix = text.split("-", 1)[0].strip()
+    try:
+        return int(prefix)
+    except Exception:
+        return pd.NA
+
+def simplify_clingen_assertion(assertion_value) -> str:
+    if pd.isna(assertion_value):
+        return "Missing"
+
+    text = str(assertion_value).strip()
+    if not text:
+        return "Missing"
+
+    if " - " in text:
+        label = text.split(" - ", 1)[1]
+    else:
+        label = text
+
+    if " (" in label:
+        label = label.split(" (", 1)[0]
+
+    return label.strip() or "Missing"
+
+def load_clingen_dosage_summary(csv_path: str) -> pd.DataFrame:
+    p = Path(csv_path)
+    if not p.exists():
+        return pd.DataFrame(columns=[
+            "Gene_Symbol_norm",
+            "ClinGen_HI_Score",
+            "ClinGen_HI_Label",
+            "ClinGen_TS_Score",
+            "ClinGen_TS_Label",
+        ])
+
+    try:
+        raw = pd.read_csv(p, skiprows=3)
+    except Exception:
+        return pd.DataFrame(columns=[
+            "Gene_Symbol_norm",
+            "ClinGen_HI_Score",
+            "ClinGen_HI_Label",
+            "ClinGen_TS_Score",
+            "ClinGen_TS_Label",
+        ])
+
+    required_cols = {
+        "gene_symbol",
+        "dosage_haploinsufficiency_assertion",
+        "dosage_triplosensitivity_assertion",
+    }
+    if not required_cols.issubset(raw.columns):
+        return pd.DataFrame(columns=[
+            "Gene_Symbol_norm",
+            "ClinGen_HI_Score",
+            "ClinGen_HI_Label",
+            "ClinGen_TS_Score",
+            "ClinGen_TS_Label",
+        ])
+
+    raw = raw.copy()
+    raw["Gene_Symbol_norm"] = raw["gene_symbol"].map(normalize_gene_symbol)
+    raw = raw[raw["Gene_Symbol_norm"] != ""].copy()
+
+    hi_df = raw[["Gene_Symbol_norm", "dosage_haploinsufficiency_assertion"]].copy()
+    hi_df["ClinGen_HI_Score"] = hi_df["dosage_haploinsufficiency_assertion"].map(parse_clingen_score)
+    hi_df["ClinGen_HI_Label"] = hi_df["dosage_haploinsufficiency_assertion"].map(simplify_clingen_assertion)
+    hi_df = hi_df.sort_values(
+        by=["Gene_Symbol_norm", "ClinGen_HI_Score"],
+        ascending=[True, False],
+        na_position="last"
+    ).drop_duplicates(subset=["Gene_Symbol_norm"], keep="first")
+    hi_df = hi_df[["Gene_Symbol_norm", "ClinGen_HI_Score", "ClinGen_HI_Label"]]
+
+    ts_df = raw[["Gene_Symbol_norm", "dosage_triplosensitivity_assertion"]].copy()
+    ts_df["ClinGen_TS_Score"] = ts_df["dosage_triplosensitivity_assertion"].map(parse_clingen_score)
+    ts_df["ClinGen_TS_Label"] = ts_df["dosage_triplosensitivity_assertion"].map(simplify_clingen_assertion)
+    ts_df = ts_df.sort_values(
+        by=["Gene_Symbol_norm", "ClinGen_TS_Score"],
+        ascending=[True, False],
+        na_position="last"
+    ).drop_duplicates(subset=["Gene_Symbol_norm"], keep="first")
+    ts_df = ts_df[["Gene_Symbol_norm", "ClinGen_TS_Score", "ClinGen_TS_Label"]]
+
+    merged = hi_df.merge(ts_df, how="outer", on="Gene_Symbol_norm")
+    return merged
 
 
 def normalize_gene_symbol(x):
@@ -395,6 +490,268 @@ def build_pairwise_gene_summary(df: pd.DataFrame) -> pd.DataFrame:
 
     return summary.sort_values("Shared_Targetable_Genes", ascending=False)
 
+def add_variant_site_key(df: pd.DataFrame, gene_col: str = "Gene") -> pd.DataFrame:
+    out = df.copy()
+    out["Variant_Site_Key"] = (
+        out[gene_col].astype(str) + "_" +
+        out["Chromosome"].astype(str) + ":" +
+        out["Position"].astype(str) + ":" +
+        out["Ref_Allele"].astype(str) + ">" +
+        out["Alt_Allele"].astype(str)
+    )
+    return out
+
+def build_variant_universe_context_summary(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=[
+            "Cell_Line",
+            "Editing_Strategy",
+            "Condition",
+            "Genes_with_Filtered_Variants",
+            "Unique_Variant_Sites",
+            "Filtered_Variant_Rows",
+        ])
+
+    tmp = add_variant_site_key(df)
+    summary = (
+        tmp.groupby(["Cell_Line", "Editing_Strategy"], dropna=False)
+        .agg(
+            Genes_with_Filtered_Variants=("Gene", "nunique"),
+            Unique_Variant_Sites=("Variant_Site_Key", "nunique"),
+            Filtered_Variant_Rows=("Variant_Site_Key", "size"),
+        )
+        .reset_index()
+    )
+    summary["Condition"] = summary.apply(
+        lambda row: condition_label(row["Cell_Line"], row["Editing_Strategy"]),
+        axis=1
+    )
+    return summary.sort_values(
+        by=["Unique_Variant_Sites", "Genes_with_Filtered_Variants", "Condition"],
+        ascending=[False, False, True]
+    )
+
+def build_variant_universe_line_summary(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=[
+            "Cell_Line",
+            "Genes_with_Filtered_Variants",
+            "Unique_Variant_Sites",
+            "Editing_Strategies_Present",
+        ])
+
+    tmp = add_variant_site_key(df)
+    summary = (
+        tmp.groupby("Cell_Line", dropna=False)
+        .agg(
+            Genes_with_Filtered_Variants=("Gene", "nunique"),
+            Unique_Variant_Sites=("Variant_Site_Key", "nunique"),
+            Editing_Strategies_Present=("Editing_Strategy", "nunique"),
+        )
+        .reset_index()
+    )
+    summary["Cell_Line_Display"] = summary["Cell_Line"].map(prettify_cell_line)
+    return summary.sort_values(
+        by=["Unique_Variant_Sites", "Genes_with_Filtered_Variants", "Cell_Line_Display"],
+        ascending=[False, False, True]
+    )
+
+def build_variant_universe_strategy_summary(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=[
+            "Editing_Strategy",
+            "Genes_with_Filtered_Variants",
+            "Unique_Variant_Sites",
+            "Cell_Lines_Present",
+        ])
+
+    tmp = add_variant_site_key(df)
+    summary = (
+        tmp.groupby("Editing_Strategy", dropna=False)
+        .agg(
+            Genes_with_Filtered_Variants=("Gene", "nunique"),
+            Unique_Variant_Sites=("Variant_Site_Key", "nunique"),
+            Cell_Lines_Present=("Cell_Line", "nunique"),
+        )
+        .reset_index()
+    )
+    summary["Editing_Strategy_Display"] = summary["Editing_Strategy"].map(prettify_strategy)
+    return summary.sort_values(
+        by=["Unique_Variant_Sites", "Genes_with_Filtered_Variants", "Editing_Strategy_Display"],
+        ascending=[False, False, True]
+    )
+
+def build_shared_position_only_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df.iloc[0:0].copy()
+
+    tmp = add_variant_site_key(df)
+    tmp["Condition"] = tmp.apply(
+        lambda row: condition_label(row["Cell_Line"], row["Editing_Strategy"]),
+        axis=1
+    )
+    shared_sites = (
+        tmp.groupby("Variant_Site_Key")["Condition"]
+        .nunique()
+        .reset_index(name="Condition_Count")
+    )
+    shared_sites = shared_sites[shared_sites["Condition_Count"] >= 2]["Variant_Site_Key"]
+    return tmp[tmp["Variant_Site_Key"].isin(shared_sites)].drop(columns=["Condition"]).copy()
+
+def build_context_matrix(summary_df: pd.DataFrame, value_col: str) -> pd.DataFrame:
+    if summary_df.empty:
+        return pd.DataFrame()
+
+    tmp = summary_df.copy()
+    tmp["Cell_Line_Display"] = tmp["Cell_Line"].map(prettify_cell_line)
+    tmp["Editing_Strategy_Display"] = tmp["Editing_Strategy"].map(prettify_strategy)
+    matrix = tmp.pivot_table(
+        index="Cell_Line_Display",
+        columns="Editing_Strategy_Display",
+        values=value_col,
+        aggfunc="sum",
+        fill_value=0
+    )
+    return matrix.reindex(sorted(matrix.index), axis=0).reindex(sorted(matrix.columns), axis=1)
+
+def render_summary_heatmap(matrix: pd.DataFrame, title: str, color_title: str, color_scale: str):
+    if matrix.empty:
+        st.info(f"No data available for {title.lower()}.")
+        return
+
+    fig = px.imshow(
+        matrix,
+        text_auto=True,
+        color_continuous_scale=color_scale,
+        title=title,
+        labels=dict(x="Editing strategy", y="Cell line", color=color_title)
+    )
+    fig.update_layout(height=max(420, 80 * len(matrix.index) + 180))
+    fig.update_xaxes(tickangle=-25, automargin=True)
+    fig.update_yaxes(automargin=True)
+    st.plotly_chart(fig, use_container_width=True)
+
+def build_cell_line_uniqueness_summary(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=[
+            "Cell_Line",
+            "Total_Unique_Common_Variant_Sites",
+            "Private_to_This_Cell_Line",
+            "Shared_with_Other_Cell_Lines",
+            "Genes_with_Private_Sites",
+        ])
+
+    tmp = add_variant_site_key(df)
+    site_lines = (
+        tmp.groupby("Variant_Site_Key")["Cell_Line"]
+        .nunique()
+        .reset_index(name="Cell_Line_Count")
+    )
+    tmp = tmp.merge(site_lines, how="left", on="Variant_Site_Key")
+
+    total_summary = (
+        tmp.groupby("Cell_Line", dropna=False)
+        .agg(
+            Total_Unique_Common_Variant_Sites=("Variant_Site_Key", "nunique"),
+        )
+        .reset_index()
+    )
+
+    private_tmp = tmp[tmp["Cell_Line_Count"] == 1].copy()
+    private_summary = (
+        private_tmp.groupby("Cell_Line", dropna=False)
+        .agg(
+            Private_to_This_Cell_Line=("Variant_Site_Key", "nunique"),
+            Genes_with_Private_Sites=("Gene", "nunique"),
+        )
+        .reset_index()
+    )
+
+    summary = total_summary.merge(private_summary, how="left", on="Cell_Line")
+    summary["Private_to_This_Cell_Line"] = summary["Private_to_This_Cell_Line"].fillna(0).astype(int)
+    summary["Genes_with_Private_Sites"] = summary["Genes_with_Private_Sites"].fillna(0).astype(int)
+    summary["Shared_with_Other_Cell_Lines"] = (
+        summary["Total_Unique_Common_Variant_Sites"] - summary["Private_to_This_Cell_Line"]
+    )
+    summary["Cell_Line_Display"] = summary["Cell_Line"].map(prettify_cell_line)
+    return summary.sort_values(
+        by=["Private_to_This_Cell_Line", "Total_Unique_Common_Variant_Sites", "Cell_Line_Display"],
+        ascending=[False, False, True]
+    )
+
+def build_strategy_overlap_summary(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=[
+            "Strategy_Combination",
+            "Unique_CellLine_Sites",
+            "Unique_Genes",
+            "Cell_Lines_With_This_Pattern",
+        ])
+
+    tmp = add_variant_site_key(df)
+    strategy_sets = (
+        tmp.groupby(["Cell_Line", "Variant_Site_Key"], dropna=False)
+        .agg(
+            Gene=("Gene", "first"),
+            Strategy_Set=("Editing_Strategy", lambda x: tuple(sorted(set(map(str, x)))))
+        )
+        .reset_index()
+    )
+    strategy_sets["Strategy_Combination"] = strategy_sets["Strategy_Set"].map(
+        lambda combo: " + ".join(prettify_strategy(x) for x in combo)
+    )
+    summary = (
+        strategy_sets.groupby(["Strategy_Set", "Strategy_Combination"], dropna=False)
+        .agg(
+            Unique_CellLine_Sites=("Variant_Site_Key", "nunique"),
+            Unique_Genes=("Gene", "nunique"),
+            Cell_Lines_With_This_Pattern=("Cell_Line", "nunique"),
+        )
+        .reset_index()
+        .drop(columns=["Strategy_Set"])
+    )
+    return summary.sort_values(
+        by=["Unique_CellLine_Sites", "Unique_Genes", "Strategy_Combination"],
+        ascending=[False, False, True]
+    )
+
+CLINGEN_CATEGORY_OPTIONS = [
+    "Strong / emerging sensitivity",
+    "No / little evidence",
+    "Sensitivity unlikely",
+    "Autosomal recessive",
+    "Missing annotation",
+]
+
+def clingen_score_to_category(score_value) -> str:
+    if pd.isna(score_value):
+        return "Missing annotation"
+
+    try:
+        score = int(score_value)
+    except Exception:
+        return "Missing annotation"
+
+    if score in [2, 3]:
+        return "Strong / emerging sensitivity"
+    if score in [0, 1]:
+        return "No / little evidence"
+    if score == 40:
+        return "Sensitivity unlikely"
+    if score == 30:
+        return "Autosomal recessive"
+    return "Missing annotation"
+
+def clingen_score_filter_mask(df: pd.DataFrame, score_col: str, selected_categories: list) -> pd.Series:
+    if score_col not in df.columns:
+        return pd.Series(True, index=df.index)
+
+    if not selected_categories or set(selected_categories) == set(CLINGEN_CATEGORY_OPTIONS):
+        return pd.Series(True, index=df.index)
+
+    categories = pd.to_numeric(df[score_col], errors="coerce").map(clingen_score_to_category)
+    return categories.isin(selected_categories)
+
 def coerce_variant_df_types(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     for col in ["Position", "Population_Variant_Frequency"]:
@@ -635,6 +992,7 @@ def load_data():
     cardiac = pd.read_csv(CARDIAC_CSV)
     neuron = pd.read_csv(NEURON_CSV)
     annot = pd.read_excel(ANNOT_XLSX, sheet_name=ANNOT_SHEET)
+    clingen_df = load_clingen_dosage_summary(CLINGEN_DOSAGE_CSV)
 
     cardiac = add_dataset_label(cardiac, "Cardiac")
     neuron = add_dataset_label(neuron, "Neuron")
@@ -644,9 +1002,31 @@ def load_data():
     left_key, right_key = pick_annotation_key(metrics_df, annot)
     merged = metrics_df.merge(annot, how="left", left_on=left_key, right_on=right_key)
 
+    if not clingen_df.empty:
+        merged["Gene_Symbol_norm"] = merged["Gene_Symbol"].map(normalize_gene_symbol)
+        merged = merged.merge(clingen_df, how="left", on="Gene_Symbol_norm")
+    else:
+        merged["ClinGen_HI_Score"] = pd.NA
+        merged["ClinGen_HI_Label"] = "Missing"
+        merged["ClinGen_TS_Score"] = pd.NA
+        merged["ClinGen_TS_Label"] = "Missing"
+
     for col in ["dominant_mutation_count", "Citation_Count", "s_het"]:
         if col in merged.columns:
             merged[col] = safe_numeric(merged[col], fill_value=0)
+
+    for col in ["ClinGen_HI_Score", "ClinGen_TS_Score"]:
+        if col in merged.columns:
+            merged[col] = pd.to_numeric(merged[col], errors="coerce")
+
+    for col in ["ClinGen_HI_Label", "ClinGen_TS_Label"]:
+        if col in merged.columns:
+            merged[col] = merged[col].fillna("Missing").astype(str)
+
+    if "ClinGen_HI_Score" in merged.columns:
+        merged["ClinGen_HI_Category"] = merged["ClinGen_HI_Score"].map(clingen_score_to_category)
+    if "ClinGen_TS_Score" in merged.columns:
+        merged["ClinGen_TS_Category"] = merged["ClinGen_TS_Score"].map(clingen_score_to_category)
 
     for col in ["HPO_Cardiovascular", "HPO_Nervous", "HPO_Metabolism", "HPO_Musculoskeletal"]:
         if col in merged.columns:
@@ -654,7 +1034,6 @@ def load_data():
 
     epi_gene_df = load_epi_promoter_gene_flags(EPI_PROM_GENE_CSV)
     if not epi_gene_df.empty:
-        merged["Gene_Symbol_norm"] = merged["Gene_Symbol"].map(normalize_gene_symbol)
         merged = merged.merge(
             epi_gene_df[["Gene_Symbol_norm", "targetable_epi_silencing_100_200_prom"]],
             how="left",
@@ -769,14 +1148,14 @@ TUTORIAL_STEPS = [
     },
     {
         "title": "9. Read the outputs",
-        "sidebar": "Use the metrics, heatmaps, plots, and tables to verify which genes survived and why.",
+        "sidebar": "Use the tabs to move from summary to overlap to detailed tables.",
         "body": """
-        The summary cards use different units.
+        Read the app from left to right by tab.
 
-        - **Genes with filtered variants**: unique genes with at least one surviving variant row.
-        - **Unique genomic variant sites**: distinct `chromosome:position:ref>alt` sites after collapsing duplicate rows across contexts.
-        - **Pairwise Shared Targetable Positions**: number of shared heterozygous targetable variant sites between two cell line / strategy contexts.
-        - **Pairwise Shared Genes**: number of unique genes shared between two cell line / strategy contexts, regardless of whether the exact variant position is the same.
+        - **Overview**: broad counts and heatmaps for what remains after filtering.
+        - **Overlap**: pairwise sharing and optional UpSet intersections.
+        - **Tables**: detailed gene, variant, and expression tables.
+        - **Downloads**: export the filtered results.
         """,
     },
 ]
@@ -784,34 +1163,40 @@ TUTORIAL_STEPS = [
 if "tutorial_step" not in st.session_state:
     st.session_state.tutorial_step = 0
 
-with st.container(border=True):
-    st.markdown("### Guided tutorial")
-    t_left, t_right = st.columns([1, 2])
-    with t_left:
-        selected_tutorial_title = st.selectbox(
-            "Tutorial step",
-            [step["title"] for step in TUTORIAL_STEPS],
-            index=st.session_state.tutorial_step,
-            help="Pick a step to learn what that part of the dashboard controls. Use Previous and Next to walk through the app in order."
-        )
-        st.session_state.tutorial_step = [step["title"] for step in TUTORIAL_STEPS].index(selected_tutorial_title)
-        prev_col, next_col = st.columns(2)
-        with prev_col:
-            if st.button("Previous", disabled=st.session_state.tutorial_step == 0, help="Go to the previous tutorial step."):
-                st.session_state.tutorial_step -= 1
-                st.rerun()
-        with next_col:
-            if st.button("Next", disabled=st.session_state.tutorial_step == len(TUTORIAL_STEPS) - 1, help="Go to the next tutorial step."):
-                st.session_state.tutorial_step += 1
-                st.rerun()
-    with t_right:
-        current_step = TUTORIAL_STEPS[st.session_state.tutorial_step]
-        st.markdown(f"#### {current_step['title']}")
-        st.markdown(current_step["body"])
-        #st.info(f"Sidebar focus: {current_step['sidebar']}")
+show_tutorial = st.checkbox(
+    "Show guided tutorial",
+    value=False,
+    help="Turn this on when someone wants a walkthrough of the app. It is hidden by default to keep the page compact."
+)
+
+if show_tutorial:
+    with st.container(border=True):
+        st.markdown("### Guided tutorial")
+        t_left, t_right = st.columns([1, 2])
+        with t_left:
+            selected_tutorial_title = st.selectbox(
+                "Tutorial step",
+                [step["title"] for step in TUTORIAL_STEPS],
+                index=st.session_state.tutorial_step,
+                help="Pick a step to learn what that part of the dashboard controls. Use Previous and Next to walk through the app in order."
+            )
+            st.session_state.tutorial_step = [step["title"] for step in TUTORIAL_STEPS].index(selected_tutorial_title)
+            prev_col, next_col = st.columns(2)
+            with prev_col:
+                if st.button("Previous", disabled=st.session_state.tutorial_step == 0, help="Go to the previous tutorial step."):
+                    st.session_state.tutorial_step -= 1
+                    st.rerun()
+            with next_col:
+                if st.button("Next", disabled=st.session_state.tutorial_step == len(TUTORIAL_STEPS) - 1, help="Go to the next tutorial step."):
+                    st.session_state.tutorial_step += 1
+                    st.rerun()
+        with t_right:
+            current_step = TUTORIAL_STEPS[st.session_state.tutorial_step]
+            st.markdown(f"#### {current_step['title']}")
+            st.markdown(current_step["body"])
 
 def tutorial_active(*step_indices):
-    return st.session_state.tutorial_step in step_indices
+    return show_tutorial and st.session_state.tutorial_step in step_indices
 
 def sidebar_section_title(title, *step_indices):
     if tutorial_active(*step_indices):
@@ -954,6 +1339,20 @@ with st.sidebar.expander("Clinical Phenotypes (HPO)"):
     req_neuro = st.checkbox(tutorial_label("Nervous System", 5), help="Keep genes annotated to nervous system abnormality.")
     req_metab = st.checkbox(tutorial_label("Metabolism / Homeostasis", 5), help="Keep genes annotated to metabolism or homeostasis abnormality.")
     req_musculo = st.checkbox(tutorial_label("Musculoskeletal System", 5), help="Keep genes annotated to musculoskeletal system abnormality.")
+
+with st.sidebar.expander("ClinGen Dosage Sensitivity"):
+    hi_filter_categories = st.multiselect(
+        tutorial_label("HI categories", 5),
+        CLINGEN_CATEGORY_OPTIONS,
+        default=CLINGEN_CATEGORY_OPTIONS,
+        help="ClinGen HI categories. Strong and emerging evidence are combined. No and little evidence are combined."
+    )
+    ts_filter_categories = st.multiselect(
+        tutorial_label("TS categories", 5),
+        CLINGEN_CATEGORY_OPTIONS,
+        default=CLINGEN_CATEGORY_OPTIONS,
+        help="ClinGen TS categories. Strong and emerging evidence are combined. No and little evidence are combined."
+    )
 
 if variant_master_df.empty:
     sidebar_section_title("Variant Filters", 6, 7)
@@ -1127,7 +1526,23 @@ else:
 # ------------------------------------------------
 # Filter Applications
 # ------------------------------------------------
-annot_cols = ["Gene_Symbol", "dominant_mutation_count", "Citation_Count", "s_het", "HPO_Cardiovascular", "HPO_Nervous", "HPO_Metabolism", "HPO_Musculoskeletal", "targetable_epi_silencing_100_200_prom"]
+annot_cols = [
+    "Gene_Symbol",
+    "dominant_mutation_count",
+    "Citation_Count",
+    "s_het",
+    "HPO_Cardiovascular",
+    "HPO_Nervous",
+    "HPO_Metabolism",
+    "HPO_Musculoskeletal",
+    "targetable_epi_silencing_100_200_prom",
+    "ClinGen_HI_Score",
+    "ClinGen_HI_Label",
+    "ClinGen_HI_Category",
+    "ClinGen_TS_Score",
+    "ClinGen_TS_Label",
+    "ClinGen_TS_Category",
+]
 available_annot_cols = [c for c in annot_cols if c in df.columns]
 gene_level_df = df[available_annot_cols].drop_duplicates()
 
@@ -1155,6 +1570,10 @@ if req_metab and "HPO_Metabolism" in gene_level_df.columns:
     gene_level_df = gene_level_df[gene_level_df["HPO_Metabolism"] == True]
 if req_musculo and "HPO_Musculoskeletal" in gene_level_df.columns:
     gene_level_df = gene_level_df[gene_level_df["HPO_Musculoskeletal"] == True]
+if "ClinGen_HI_Score" in gene_level_df.columns:
+    gene_level_df = gene_level_df[clingen_score_filter_mask(gene_level_df, "ClinGen_HI_Score", hi_filter_categories)]
+if "ClinGen_TS_Score" in gene_level_df.columns:
+    gene_level_df = gene_level_df[clingen_score_filter_mask(gene_level_df, "ClinGen_TS_Score", ts_filter_categories)]
 filtered_gene_set = set(gene_level_df["Gene_Symbol"].dropna().unique())
 
 # Expression Application
@@ -1186,9 +1605,17 @@ else:
 if variant_master_df.empty:
     filtered_variant_df = pd.DataFrame()
     overlap_variant_df = pd.DataFrame()
+    shared_position_variant_df = pd.DataFrame()
     gene_variant_summary = pd.DataFrame()
     pairwise_variant_summary = pd.DataFrame()
     pairwise_gene_summary = pd.DataFrame()
+    variant_universe_context_summary = pd.DataFrame()
+    variant_universe_line_summary = pd.DataFrame()
+    variant_universe_strategy_summary = pd.DataFrame()
+    shared_position_line_summary = pd.DataFrame()
+    shared_position_strategy_summary = pd.DataFrame()
+    cell_line_uniqueness_summary = pd.DataFrame()
+    strategy_overlap_summary = pd.DataFrame()
 else:
     filtered_variant_df = variant_master_df.copy()
 
@@ -1221,227 +1648,372 @@ else:
     overlap_variant_df = expand_variant_rows_for_selected_strategy_options(
         filtered_variant_df, selected_variant_strategies
     )
+    shared_position_variant_df = build_shared_position_only_df(overlap_variant_df)
     gene_variant_summary = build_variant_gene_summary(filtered_variant_df)
     pairwise_variant_summary = build_pairwise_summary(overlap_variant_df)
     pairwise_gene_summary = build_pairwise_gene_summary(overlap_variant_df)
+    variant_universe_context_summary = build_variant_universe_context_summary(overlap_variant_df)
+    variant_universe_line_summary = build_variant_universe_line_summary(overlap_variant_df)
+    variant_universe_strategy_summary = build_variant_universe_strategy_summary(overlap_variant_df)
+    shared_position_line_summary = build_variant_universe_line_summary(shared_position_variant_df)
+    shared_position_strategy_summary = build_variant_universe_strategy_summary(shared_position_variant_df)
+    cell_line_uniqueness_summary = build_cell_line_uniqueness_summary(filtered_variant_df)
+    strategy_overlap_summary = build_strategy_overlap_summary(overlap_variant_df)
 
 # ------------------------------------------------
 # UI Dashboards
 # ------------------------------------------------
 unique_gene_count = len(filtered_gene_set)
 
-if include_expression and not filtered_df.empty:
-    st.metric("Highest Detection Rate", f"{filtered_df[det_col].max():.2f}%")
-
-# st.subheader("Variant Summary for Currently Filtered Genes")
-v1, v2 = st.columns(2)
-if filtered_variant_df.empty:
-    v1.metric("Genes with filtered variants", 0)
-    v2.metric("Unique genomic variant sites", 0)
-    #v4.metric("Max Population Var Freq", "NA")
-else:
-    v1.metric("Genes with filtered variants", filtered_variant_df["Gene"].nunique())
-    filtered_variant_df["Variant_Site_Key"] = (
-        filtered_variant_df["Chromosome"].astype(str) + ":" +
-        filtered_variant_df["Position"].astype(str) + ":" +
-        filtered_variant_df["Ref_Allele"].astype(str) + ">" +
-        filtered_variant_df["Alt_Allele"].astype(str)
-    )
-    v2.metric("Unique genomic variant sites", filtered_variant_df["Variant_Site_Key"].nunique())
-    max_pop_val = pd.to_numeric(filtered_variant_df["Population_Variant_Frequency"], errors="coerce")
-    # if max_pop_val.notna().any():
-    #     v4.metric("Max Population Var Freq", f"{max_pop_val.max():.3f}")
-    # else:
-    #     v4.metric("Max Population Var Freq", "NA")
-
-with st.expander("How to read these variant counts"):
-    st.markdown("""
-    - **Genes with filtered variants**: unique genes that still have at least one variant row after all active gene, expression, and variant filters.
-    - **Filtered variant rows**: rows remaining in the variant table. This can be larger than the number of genes because one gene can have many variants, and one genomic site can appear in multiple cell line or editing-strategy contexts.
-    - **Unique genomic variant sites**: distinct `chromosome:position:ref>alt` sites after filtering. This collapses duplicate rows for the same genomic variant across contexts.
-    - **CRISPRoff high confidence** in the Editing Strategy filter keeps variant rows that overlap the promoter-window CRISPRoff target-site map.
-    """)
-
+tab_labels = ["Overview", "Overlap", "Tables", "Downloads"]
 if include_expression:
-    st.subheader("Detection Rate Distribution")
-    if not base_df.empty:
-        fig_hist = px.histogram(
-            base_df, x=det_col, color="Detectability_Context", nbins=50, barmode="overlay", opacity=0.65,
-            title=f"Distribution within Selected Conditions ({qc_level})",
+    tab_labels.insert(1, "Expression")
+tabs = st.tabs(tab_labels)
+tab_map = dict(zip(tab_labels, tabs))
+
+with tab_map["Overview"]:
+    st.caption("Recommended reading order: Overview -> Overlap -> Tables.")
+    st.markdown(
+        "This first tab is the broad summary. It is meant to answer, at a glance, which cell lines and editing "
+        "strategies still contain filtered variants before looking at intersections."
+    )
+
+    overview_cols = st.columns(3)
+    overview_cols[0].metric("Genes after gene-level filters", unique_gene_count)
+    overview_cols[1].metric("Filtered variant rows", int(len(filtered_variant_df)))
+    overview_cols[2].metric(
+        "Cell line / strategy contexts",
+        int(variant_universe_context_summary["Condition"].nunique()) if not variant_universe_context_summary.empty else 0
+    )
+
+    st.subheader("Overview Variant") # originally called Variant Universe Before Intersections
+    if overlap_variant_df.empty:
+        st.info("No filtered variant contexts remain to summarize.")
+    else:
+        line_col, strat_col = st.columns(2)
+        with line_col:
+            st.markdown("### By cell line overall")
+            line_table = variant_universe_line_summary.rename(columns={"Cell_Line_Display": "Cell line"})
+            render_bold_dataframe(
+                line_table[[
+                    "Cell line",
+                    "Genes_with_Filtered_Variants",
+                    "Unique_Variant_Sites",
+                    "Editing_Strategies_Present",
+                ]].set_index("Cell line")
+            )
+        with strat_col:
+            st.markdown("### By editing strategy overall")
+            strat_table = variant_universe_strategy_summary.rename(columns={"Editing_Strategy_Display": "Editing strategy"})
+            render_bold_dataframe(
+                strat_table[[
+                    "Editing strategy",
+                    "Genes_with_Filtered_Variants",
+                    "Unique_Variant_Sites",
+                    "Cell_Lines_Present",
+                ]].set_index("Editing strategy")
+            )
+
+        with st.expander("Heatmaps: cell line by editing strategy", expanded=True):
+            render_summary_heatmap(
+                build_context_matrix(variant_universe_context_summary, "Unique_Variant_Sites"),
+                "Unique Variant Sites by Cell Line and Editing Strategy",
+                "Unique sites",
+                "Blues"
+            )
+            render_summary_heatmap(
+                build_context_matrix(variant_universe_context_summary, "Genes_with_Filtered_Variants"),
+                "Genes with Filtered Variants by Cell Line and Editing Strategy",
+                "Genes",
+                "Greens"
+            )
+
+    st.subheader("Editing Strategy Overlap Overview")
+    st.caption(
+        "This summarizes how the same variant site behaves across editing strategies within each cell line. "
+        "Base-edit window expansion to 25 bp, 30 bp, 40 bp, and beyond still depends on upstream variant-table recalculation."
+    )
+    if strategy_overlap_summary.empty:
+        st.info("No strategy-overlap patterns are available for the current filters.")
+    else:
+        fig_strategy_overlap = px.bar(
+            strategy_overlap_summary.head(12),
+            x="Strategy_Combination",
+            y="Unique_CellLine_Sites",
+            hover_data=["Unique_Genes", "Cell_Lines_With_This_Pattern"],
+            title="Most Common Strategy-Overlap Patterns",
             labels={
-                det_col: f"{qc_level} Detection Rate (%)",
-                "Detectability_Context": "Cell Line"
+                "Strategy_Combination": "Strategy combination",
+                "Unique_CellLine_Sites": "Unique cell-line sites",
             }
         )
-        fig_hist.add_vline(x=min_det, line_dash="dash", line_color="red", annotation_text=f"Cutoff: {min_det}%", annotation_position="top right")
-        st.plotly_chart(fig_hist, use_container_width=True)
+        fig_strategy_overlap.update_xaxes(tickangle=-25)
+        st.plotly_chart(fig_strategy_overlap, use_container_width=True)
+        with st.expander("Show strategy-overlap table"):
+            render_bold_dataframe(strategy_overlap_summary.set_index("Strategy_Combination"))
 
-# ------------------------------------------------
-# Tables & Visualizations
-# ------------------------------------------------
-# ------------------------------------------------
-# UPSET PLOTS SECTION
-# ------------------------------------------------
-st.subheader("Pairwise Overlap Heatmaps")
-
-st.markdown("Shows overlap between pairs of cell line / editing strategy conditions after the current filters.")
-st.caption(
-    "Position overlap means the exact same genomic variant site is shared. "
-    "Gene overlap means both conditions have at least one filtered targetable heterozygous variant in the same gene, "
-    "even if the variant positions are different."
-)
-
-heatmap_condition_order = condition_order_from_variants(overlap_variant_df) if "overlap_variant_df" in locals() else []
-
-if not heatmap_condition_order:
-    st.info("No cell line / editing strategy conditions remain after the current filters.")
-else:
-    if 'pairwise_variant_summary' not in locals():
-        pairwise_variant_summary = pd.DataFrame()
-    position_matrix = symmetric_pairwise_matrix(
-        pairwise_variant_summary,
-        "Shared_Targetable_Positions",
-        heatmap_condition_order
+    st.subheader("Unique Common Variants by Cell Line")
+    st.markdown(
+        "These counts collapse across editing strategies and focus on whether a common heterozygous variant site is "
+        "private to one cell line or shared across multiple cell lines."
     )
-    render_pairwise_heatmap(
-        position_matrix,
-        "Pairwise Shared Targetable Positions",
-        "Shared Positions",
-        "Blues"
-    )
-
-    if 'pairwise_gene_summary' not in locals():
-        pairwise_gene_summary = pd.DataFrame()
-    gene_matrix = symmetric_pairwise_matrix(
-        pairwise_gene_summary,
-        "Shared_Targetable_Genes",
-        heatmap_condition_order
-    )
-    render_pairwise_heatmap(
-        gene_matrix,
-        "Pairwise Shared Genes with Targetable Heterozygous Variants",
-        "Shared Genes",
-        "Greens"
-    )
-
-show_upset_plots = st.checkbox(
-    "Show UpSet plots for position intersections",
-    value=False,
-    help="Optional. These plots can be busy; turn them on when you want set-intersection detail beyond the heatmaps."
-)
-
-if show_upset_plots:
-    st.subheader("Position Intersections UpSet Plots")
-    if overlap_variant_df.empty:
-        st.info("No variants available for UpSet plots.")
+    if cell_line_uniqueness_summary.empty:
+        st.info("No cell-line uniqueness summary is available for the current filters.")
     else:
-        tmp_upset = overlap_variant_df.copy()
-        tmp_upset["Site_Key"] = (
-            tmp_upset["Gene"] + "_" +
-            tmp_upset["Chromosome"].astype(str) + ":" +
-            tmp_upset["Position"].astype(str) + ":" +
-            tmp_upset["Ref_Allele"] + ">" + tmp_upset["Alt_Allele"]
+        uniqueness_display = cell_line_uniqueness_summary.rename(columns={"Cell_Line_Display": "Cell line"})
+        fig_private = px.bar(
+            uniqueness_display,
+            x="Cell line",
+            y=["Private_to_This_Cell_Line", "Shared_with_Other_Cell_Lines"],
+            barmode="stack",
+            title="Private vs Shared Common Variant Sites by Cell Line",
+            labels={"value": "Unique common variant sites", "variable": "Site class"}
         )
-        tmp_upset["Condition"] = tmp_upset.apply(
-            lambda row: condition_label(row["Cell_Line"], row["Editing_Strategy"]),
-            axis=1
-        )
-
-        site_conditions = tmp_upset.groupby("Site_Key")["Condition"].apply(lambda x: tuple(sorted(set(x))))
-        combination_counts = site_conditions.value_counts()
-
-        pairwise_data = combination_counts[combination_counts.index.map(len) == 2]
-        complex_data = combination_counts[combination_counts.index.map(len) > 2]
-
-        st.markdown("### 1. Pairwise Intersections (Exactly 2)")
-        if pairwise_data.empty:
-            st.info("No pairwise overlaps found.")
-        else:
-            n_pair = st.slider("Show Top N Pairwise Intersections", 5, 40, 15, key="n_pair_slider")
-            top_pairwise = pairwise_data.head(n_pair)
-
-            upset_pair = from_memberships(top_pairwise.index, data=top_pairwise.values)
-            fig_pair = plt.figure(figsize=(8, 4.5))
-            plot(upset_pair, fig=fig_pair, show_counts="%d", element_size=28)
-            st.pyplot(fig_pair)
-            plt.close(fig_pair)
-
-        st.markdown("### 2. Complex Overlaps (Shared by > 2)")
-        if complex_data.empty:
-            st.info("No variants are shared by 3 or more combinations.")
-        else:
-            n_complex = st.slider("Show Top N Complex Intersections", 5, 40, 15, key="n_complex_slider")
-            top_complex = complex_data.head(n_complex)
-
-            upset_complex = from_memberships(top_complex.index, data=top_complex.values)
-            fig_complex = plt.figure(figsize=(8, 4.5))
-            plot(upset_complex, fig=fig_complex, show_counts="%d", element_size=28)
-            st.pyplot(fig_complex)
-            plt.close(fig_complex)
-
-if not pairwise_variant_summary.empty:
-    with st.expander("Pairwise position overlap table"):
-        render_bold_dataframe(pairwise_variant_summary.set_index("Gene_Symbol"))
-
-# BAR PLOT & GENE SUMMARY TABLE
-st.subheader("Per-Gene Variant Count Table")
-if gene_variant_summary.empty:
-    st.info("No variant rows remain after the current expression + variant filters.")
-else:
-    sort_cols = ["Unique_Variant_Sites"]
-    ascending_vals = [False]
-
-    if "EpiSilencing_100_200_Promoter_Unique_Site_Count" in gene_variant_summary.columns:
-        sort_cols.append("EpiSilencing_100_200_Promoter_Unique_Site_Count")
-        ascending_vals.append(False)
-    elif "EpiSilencing_100_200_Promoter_Variant_Row_Count" in gene_variant_summary.columns:
-        sort_cols.append("EpiSilencing_100_200_Promoter_Variant_Row_Count")
-        ascending_vals.append(False)
-
-    gene_variant_summary = gene_variant_summary.sort_values(
-        by=sort_cols,
-        ascending=ascending_vals
-    )
-
-    render_bold_dataframe(gene_variant_summary.set_index("Gene_Symbol"))
-
-    fig_gene_bar = px.bar(
-        gene_variant_summary.head(30), x="Gene_Symbol", y="Unique_Variant_Sites",
-        hover_data=[c for c in ["Unique_Variant_Sites", "Shared_Variant_Sites_>=2_CellLines", "Min_Population_Variant_Frequency", "Max_Population_Variant_Frequency", "Mean_Population_Variant_Frequency", "Raw_Overlap_Count"] if c in gene_variant_summary.columns],
-        title="Top Genes by Filtered Variant Count",
-        labels={"Gene_Symbol": "Gene", "Unique_Variant_Sites": "# Unique Variants"}
-    )
-    st.plotly_chart(fig_gene_bar, use_container_width=True)
-
-st.subheader("Variant-Level Detail Table")
-if filtered_variant_df.empty:
-    st.info("No variant-level records match the current filters.")
-else:
-    preferred_variant_cols = ["Gene", "Cell_Line", "Editing_Strategy", "Chromosome", "Position", "Ref_Allele", "Alt_Allele", "Population_Variant_Frequency", "targetable_epi_silencing_100_200_prom", "targetable_epi_silencing_100_200_prom_variant"]
-    disp_variant_df = filtered_variant_df[[c for c in preferred_variant_cols if c in filtered_variant_df.columns]]
-    render_bold_dataframe(disp_variant_df.set_index("Gene"))
+        st.plotly_chart(fig_private, use_container_width=True)
+        with st.expander("Show unique-variant summary table"):
+            render_bold_dataframe(
+                uniqueness_display[[
+                    "Cell line",
+                    "Total_Unique_Common_Variant_Sites",
+                    "Private_to_This_Cell_Line",
+                    "Shared_with_Other_Cell_Lines",
+                    "Genes_with_Private_Sites",
+                ]].set_index("Cell line")
+            )
 
 if include_expression:
-    st.subheader("Filtered Expression Data Table")
-    preferred_cols = ["Gene_Symbol", "Dataset", "Detectability_Context", "Cell_Type", "Cell_Line", "Developmental_Stage", "Replicate", det_col, mean_all_col, mean_detected_col, agg_col, "s_het", "dominant_mutation_count", "Citation_Count", "targetable_epi_silencing_100_200_prom", "HPO_Cardiovascular", "HPO_Nervous", "HPO_Metabolism", "HPO_Musculoskeletal"]
-    table_cols = [c for c in preferred_cols if c in filtered_df.columns]
-    other_cols = [c for c in filtered_df.columns if c not in table_cols]
-    disp_expr_df = filtered_df[table_cols + other_cols]
-    disp_expr_df = disp_expr_df.rename(columns={"Detectability_Context": "Cell Line"})
-    render_bold_dataframe(disp_expr_df.set_index("Gene_Symbol"))
+    with tab_map["Expression"]:
+        st.subheader("Expression Overview")
+        if filtered_df.empty:
+            st.info("No genes remain after the current expression filters.")
+        else:
+            expr_cols = st.columns(2)
+            expr_cols[0].metric("Highest detection rate", f"{filtered_df[det_col].max():.2f}%")
+            expr_cols[1].metric("Genes in filtered expression table", int(filtered_df["Gene_Symbol"].nunique()))
 
-st.markdown("---")
-download_col1, download_col2, download_col3 = st.columns(3)
+        if not base_df.empty:
+            fig_hist = px.histogram(
+                base_df, x=det_col, color="Detectability_Context", nbins=50, barmode="overlay", opacity=0.65,
+                title=f"Distribution within Selected Conditions ({qc_level})",
+                labels={
+                    det_col: f"{qc_level} Detection Rate (%)",
+                    "Detectability_Context": "Cell Line"
+                }
+            )
+            fig_hist.add_vline(x=min_det, line_dash="dash", line_color="red", annotation_text=f"Cutoff: {min_det}%", annotation_position="top right")
+            st.plotly_chart(fig_hist, use_container_width=True)
 
-if include_expression:
-    with download_col1:
-        st.download_button(label="Download filtered expression table", data=filtered_df.to_csv(index=False).encode("utf-8"), file_name=f"dnd_expression_filtered_{qc_level}.csv", mime="text/csv")
+with tab_map["Overlap"]:
+    st.subheader("Pairwise Overlap Heatmaps")
+    st.markdown(
+        "This tab zooms in from the broad universe summary to overlaps between specific cell line / editing strategy conditions."
+    )
+    st.caption(
+        "Overview counts all filtered unique genomic variant sites that survive the current filters. "
+        "The overlap tab is narrower: it focuses on the subset of sites whose exact genomic position/ref/alt is shared across at least two cell line / strategy conditions. "
+        "Gene overlap means both conditions have at least one filtered targetable heterozygous variant in the same gene, "
+        "even if the variant positions are different."
+    )
 
-with download_col2:
-    st.download_button(label="Download gene-level variant summary", data=gene_variant_summary.to_csv(index=False).encode("utf-8") if not gene_variant_summary.empty else b"", file_name="dnd_gene_variant_summary.csv", mime="text/csv")
+    st.markdown("### Shared Positions Summary")
+    if shared_position_variant_df.empty:
+        st.info("No shared positions remain after the current filters.")
+    else:
+        shared_metric_cols = st.columns(3)
+        shared_metric_cols[1].metric("Shared positions", int(shared_position_variant_df["Variant_Site_Key"].nunique()))
+        shared_metric_cols[0].metric("Genes represented by shared positions", int(shared_position_variant_df["Gene"].nunique()))
+        shared_metric_cols[2].metric("Contexts contributing to shared positions", int(shared_position_variant_df[["Cell_Line", "Editing_Strategy"]].drop_duplicates().shape[0]))
 
-with download_col3:
-    st.download_button(label="Download variant-level filtered table", data=filtered_variant_df.to_csv(index=False).encode("utf-8") if not filtered_variant_df.empty else b"", file_name="dnd_variant_filtered.csv", mime="text/csv")
+        overlap_line_col, overlap_strat_col = st.columns(2)
+        with overlap_line_col:
+            st.markdown("#### By cell line overall")
+            overlap_line_table = shared_position_line_summary.rename(columns={"Cell_Line_Display": "Cell line"})
+            render_bold_dataframe(
+                overlap_line_table[[
+                    "Cell line",
+                    "Genes_with_Filtered_Variants",
+                    "Unique_Variant_Sites",
+                    "Editing_Strategies_Present",
+                ]].rename(columns={
+                    "Genes_with_Filtered_Variants": "Genes with shared positions",
+                    "Unique_Variant_Sites": "Shared positions",
+                    "Editing_Strategies_Present": "Editing strategies present",
+                }).set_index("Cell line")
+            )
+        with overlap_strat_col:
+            st.markdown("#### By editing strategy overall")
+            overlap_strat_table = shared_position_strategy_summary.rename(columns={"Editing_Strategy_Display": "Editing strategy"})
+            render_bold_dataframe(
+                overlap_strat_table[[
+                    "Editing strategy",
+                    "Genes_with_Filtered_Variants",
+                    "Unique_Variant_Sites",
+                    "Cell_Lines_Present",
+                ]].rename(columns={
+                    "Genes_with_Filtered_Variants": "Genes with shared positions",
+                    "Unique_Variant_Sites": "Shared positions",
+                    "Cell_Lines_Present": "Cell lines present",
+                }).set_index("Editing strategy")
+            )
+
+    heatmap_condition_order = condition_order_from_variants(overlap_variant_df) if "overlap_variant_df" in locals() else []
+
+    if not heatmap_condition_order:
+        st.info("No cell line / editing strategy conditions remain after the current filters.")
+    else:
+        position_matrix = symmetric_pairwise_matrix(
+            pairwise_variant_summary,
+            "Shared_Targetable_Positions",
+            heatmap_condition_order
+        )
+        render_pairwise_heatmap(
+            position_matrix,
+            "Pairwise Shared Targetable Positions",
+            "Shared Positions",
+            "Blues"
+        )
+
+        gene_matrix = symmetric_pairwise_matrix(
+            pairwise_gene_summary,
+            "Shared_Targetable_Genes",
+            heatmap_condition_order
+        )
+        render_pairwise_heatmap(
+            gene_matrix,
+            "Pairwise Shared Genes with Targetable Heterozygous Variants",
+            "Shared Genes",
+            "Greens"
+        )
+
+    show_upset_plots = st.checkbox(
+        "Show UpSet plots for position intersections",
+        value=False,
+        help="Optional. These plots can be busy; turn them on when you want set-intersection detail beyond the heatmaps."
+    )
+
+    if show_upset_plots:
+        st.subheader("Position Intersections UpSet Plots")
+        if overlap_variant_df.empty:
+            st.info("No variants available for UpSet plots.")
+        else:
+            tmp_upset = overlap_variant_df.copy()
+            tmp_upset["Site_Key"] = (
+                tmp_upset["Gene"] + "_" +
+                tmp_upset["Chromosome"].astype(str) + ":" +
+                tmp_upset["Position"].astype(str) + ":" +
+                tmp_upset["Ref_Allele"] + ">" + tmp_upset["Alt_Allele"]
+            )
+            tmp_upset["Condition"] = tmp_upset.apply(
+                lambda row: condition_label(row["Cell_Line"], row["Editing_Strategy"]),
+                axis=1
+            )
+
+            site_conditions = tmp_upset.groupby("Site_Key")["Condition"].apply(lambda x: tuple(sorted(set(x))))
+            combination_counts = site_conditions.value_counts().sort_values(ascending=False)
+
+            pairwise_data = combination_counts[combination_counts.index.map(len) == 2]
+            complex_data = combination_counts[combination_counts.index.map(len) > 2]
+
+            st.markdown("### 1. Pairwise Intersections (Exactly 2)")
+            if pairwise_data.empty:
+                st.info("No pairwise overlaps found.")
+            else:
+                n_pair = st.slider("Show Top N Pairwise Intersections", 5, 40, 15, key="n_pair_slider")
+                top_pairwise = pairwise_data.head(n_pair)
+
+                upset_pair = from_memberships(top_pairwise.index, data=top_pairwise.values)
+                fig_pair = plt.figure(figsize=(8, 4.5))
+                plot(upset_pair, fig=fig_pair, show_counts="%d", element_size=28)
+                st.pyplot(fig_pair)
+                plt.close(fig_pair)
+
+            st.markdown("### 2. Complex Overlaps (Shared by > 2)")
+            if complex_data.empty:
+                st.info("No variants are shared by 3 or more combinations.")
+            else:
+                n_complex = st.slider("Show Top N Complex Intersections", 5, 40, 15, key="n_complex_slider")
+                top_complex = complex_data.head(n_complex)
+
+                upset_complex = from_memberships(top_complex.index, data=top_complex.values)
+                fig_complex = plt.figure(figsize=(8, 4.5))
+                plot(upset_complex, fig=fig_complex, show_counts="%d", element_size=28)
+                st.pyplot(fig_complex)
+                plt.close(fig_complex)
+
+    if not pairwise_variant_summary.empty:
+        with st.expander("Show pairwise position overlap table"):
+            render_bold_dataframe(pairwise_variant_summary.set_index("Gene_Symbol"))
+
+with tab_map["Tables"]:
+    st.subheader("Gene and Variant Tables")
+    st.markdown("This tab keeps the detailed tables together so the main overview is easier to read.")
+
+    if gene_variant_summary.empty:
+        st.info("No variant rows remain after the current expression + variant filters.")
+    else:
+        sort_cols = ["Unique_Variant_Sites"]
+        ascending_vals = [False]
+
+        if "EpiSilencing_100_200_Promoter_Unique_Site_Count" in gene_variant_summary.columns:
+            sort_cols.append("EpiSilencing_100_200_Promoter_Unique_Site_Count")
+            ascending_vals.append(False)
+        elif "EpiSilencing_100_200_Promoter_Variant_Row_Count" in gene_variant_summary.columns:
+            sort_cols.append("EpiSilencing_100_200_Promoter_Variant_Row_Count")
+            ascending_vals.append(False)
+
+        gene_variant_summary = gene_variant_summary.sort_values(
+            by=sort_cols,
+            ascending=ascending_vals
+        )
+
+        fig_gene_bar = px.bar(
+            gene_variant_summary.head(30), x="Gene_Symbol", y="Unique_Variant_Sites",
+            hover_data=[c for c in ["Unique_Variant_Sites", "Shared_Variant_Sites_>=2_CellLines", "Min_Population_Variant_Frequency", "Max_Population_Variant_Frequency", "Mean_Population_Variant_Frequency", "Raw_Overlap_Count"] if c in gene_variant_summary.columns],
+            title="Top Genes by Filtered Variant Count",
+            labels={"Gene_Symbol": "Gene", "Unique_Variant_Sites": "# Unique Variants"}
+        )
+        st.plotly_chart(fig_gene_bar, use_container_width=True)
+
+        with st.expander("Show per-gene variant count table"):
+            render_bold_dataframe(gene_variant_summary.set_index("Gene_Symbol"))
+
+    if filtered_variant_df.empty:
+        st.info("No variant-level records match the current filters.")
+    else:
+        preferred_variant_cols = ["Gene", "Cell_Line", "Editing_Strategy", "Chromosome", "Position", "Ref_Allele", "Alt_Allele", "Population_Variant_Frequency", "targetable_epi_silencing_100_200_prom", "targetable_epi_silencing_100_200_prom_variant"]
+        disp_variant_df = filtered_variant_df[[c for c in preferred_variant_cols if c in filtered_variant_df.columns]]
+        with st.expander("Show variant-level detail table"):
+            render_bold_dataframe(disp_variant_df.set_index("Gene"))
+
+    if include_expression:
+        preferred_cols = [
+            "Gene_Symbol", "Dataset", "Detectability_Context", "Cell_Type", "Cell_Line", "Developmental_Stage",
+            "Replicate", det_col, mean_all_col, mean_detected_col, agg_col, "s_het", "dominant_mutation_count",
+            "Citation_Count", "ClinGen_HI_Score", "ClinGen_HI_Category", "ClinGen_HI_Label",
+            "ClinGen_TS_Score", "ClinGen_TS_Category", "ClinGen_TS_Label",
+            "targetable_epi_silencing_100_200_prom", "HPO_Cardiovascular", "HPO_Nervous", "HPO_Metabolism",
+            "HPO_Musculoskeletal"
+        ]
+        table_cols = [c for c in preferred_cols if c in filtered_df.columns]
+        other_cols = [c for c in filtered_df.columns if c not in table_cols]
+        disp_expr_df = filtered_df[table_cols + other_cols]
+        disp_expr_df = disp_expr_df.rename(columns={"Detectability_Context": "Cell Line"})
+        with st.expander("Show filtered expression data table"):
+            render_bold_dataframe(disp_expr_df.set_index("Gene_Symbol"))
+
+with tab_map["Downloads"]:
+    st.subheader("Download Results")
+    download_col1, download_col2, download_col3 = st.columns(3)
+
+    if include_expression:
+        with download_col1:
+            st.download_button(label="Download filtered expression table", data=filtered_df.to_csv(index=False).encode("utf-8"), file_name=f"dnd_expression_filtered_{qc_level}.csv", mime="text/csv")
+
+    with download_col2:
+        st.download_button(label="Download gene-level variant summary", data=gene_variant_summary.to_csv(index=False).encode("utf-8") if not gene_variant_summary.empty else b"", file_name="dnd_gene_variant_summary.csv", mime="text/csv")
+
+    with download_col3:
+        st.download_button(label="Download variant-level filtered table", data=filtered_variant_df.to_csv(index=False).encode("utf-8") if not filtered_variant_df.empty else b"", file_name="dnd_variant_filtered.csv", mime="text/csv")
 
 
 
