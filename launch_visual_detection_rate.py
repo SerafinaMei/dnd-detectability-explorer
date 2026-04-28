@@ -70,15 +70,15 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
+CARDIAC_CSV = "data/master_new_cardiac_qc3.csv"
+NEURON_CSV = "data/master_new_neuron_qc3.csv"
+ANNOT_XLSX = "data/genes_other_info.xlsx"
+VARIANT_FILE = "data/FINAL_Combined_Master_Variant_Table.xlsx"
+SUMMARY_TSV = "data/summary_counts.tsv" 
+EPI_PROM_GENE_CSV = "data/epi_silenceable_100_200_prom.csv"
+EPI_PROM_SITE_PKL = "data/epi_silenceable_100_200_sites.pkl"
+CLINGEN_DOSAGE_CSV = "data/Clingen-Curation-Summary.csv"
 
-CARDIAC_CSV = "detection_recheck_outputs/master_new_cardiac_qc3.csv"
-NEURON_CSV = "detection_recheck_outputs/master_new_neuron_qc3.csv"
-ANNOT_XLSX = "detection_recheck_outputs/genes_other_info.xlsx"
-VARIANT_FILE = "detection_recheck_outputs/FINAL_Combined_Master_Variant_Table.xlsx"
-SUMMARY_TSV = "detection_recheck_outputs/summary_counts.tsv" # Optional
-EPI_PROM_GENE_CSV = "detection_recheck_outputs/data/epi_silenceable_100_200_prom.csv"
-EPI_PROM_SITE_PKL = "detection_recheck_outputs/data/epi_silenceable_100_200_sites.pkl"
-CLINGEN_DOSAGE_CSV = "Preliminary/data/Clingen-Curation-Summary.csv"
 
 INPUT_SUMMARY_GENE_COUNT = 593
 INPUT_SUMMARY_CELL_LINE_COUNT = 5
