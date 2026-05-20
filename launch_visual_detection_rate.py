@@ -3,6 +3,7 @@ import csv
 import itertools
 import pickle
 from pathlib import Path
+import warnings
 
 import pandas as pd
 import plotly.express as px
@@ -10,9 +11,16 @@ import matplotlib.pyplot as plt
 from upsetplot import plot, from_memberships
 import streamlit as st
 
+warnings.filterwarnings(
+    "ignore",
+    message="A value is trying to be set on a copy of a DataFrame or Series through chained assignment using an inplace method.",
+    category=FutureWarning,
+    module="upsetplot.plotting",
+)
+
 # page config
 st.set_page_config(
-    page_title="DnD Gene Detectability Explorer",
+    page_title="D&D Gene Detectability Explorer",
     layout="wide",
     page_icon="🧬"
 )
@@ -73,7 +81,12 @@ st.markdown("""
 CARDIAC_CSV = "data/master_new_cardiac_qc3.csv"
 NEURON_CSV = "data/master_new_neuron_qc3.csv"
 ANNOT_XLSX = "data/genes_other_info.xlsx"
-VARIANT_FILE = "data/FINAL_Combined_Master_Variant_Table.xlsx"
+VARIANT_FILE = "data/pre_pam_variant_table.xlsx"
+LEGACY_VARIANT_FILE = "data/FINAL_Combined_Master_Variant_Table.xlsx"
+VARIANT_CSV_DIR = "data/pre_pam_variant_table_csv"
+VARIANT_CSV_FALLBACK_DIRS = [
+    "data/pre_pam_variant_table_test_csv",
+]
 SUMMARY_TSV = "data/summary_counts.tsv" 
 EPI_PROM_GENE_CSV = "data/epi_silenceable_100_200_prom.csv"
 EPI_PROM_SITE_PKL = "data/epi_silenceable_100_200_sites.pkl"
@@ -261,11 +274,87 @@ def load_clingen_dosage_summary(csv_path: str) -> pd.DataFrame:
 def normalize_gene_symbol(x):
     return str(x).strip().upper() if pd.notna(x) else ""
 
+
+def normalize_truthy(x) -> bool:
+    if pd.isna(x):
+        return False
+    if isinstance(x, bool):
+        return x
+    return str(x).strip().lower() in {"true", "1", "yes", "y"}
+
+def infer_is_pam_filtered(row: pd.Series) -> bool:
+    raw_flag = row.get("Is_PAM_Filtered", pd.NA)
+    if pd.notna(raw_flag):
+        return normalize_truthy(raw_flag)
+
+    status = str(row.get("PAM_Filter_Status", "")).strip().lower()
+    if status:
+        if "pre-pam" in status or "pre pam" in status:
+            return False
+        if "pam-filtered" in status or "pam filtered" in status:
+            return True
+
+    source = str(row.get("Variant_Source", "")).strip().lower()
+    if source:
+        if "pre-pam" in source or "pre pam" in source:
+            return False
+        if "pam-only" in source or "pam only" in source or "legacy" in source:
+            return True
+
+    return True
+
+def normalize_pam_filter_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    if "PAM_Filter_Status" in df.columns:
+        df["PAM_Filter_Status"] = df["PAM_Filter_Status"].astype(str)
+    if "Variant_Source" in df.columns:
+        df["Variant_Source"] = df["Variant_Source"].astype(str)
+
+    df["Is_PAM_Filtered"] = df.apply(infer_is_pam_filtered, axis=1)
+
+    if "PAM_Filter_Status" not in df.columns:
+        df["PAM_Filter_Status"] = df["Is_PAM_Filtered"].map(
+            lambda is_pam: "PAM-filtered targetable" if is_pam else "Pre-PAM expanded"
+        )
+
+    if "Variant_Source" not in df.columns:
+        df["Variant_Source"] = df["Is_PAM_Filtered"].map(
+            lambda is_pam: "legacy PAM-only table" if is_pam else "pre-PAM expanded table"
+        )
+
+    return df
+
 def normalize_position_value(x):
     try:
         return int(float(x))
     except Exception:
         return pd.NA
+
+
+def load_variant_master_table(
+    preferred_xlsx_path: str,
+    preferred_csv_dir: str,
+    legacy_xlsx_path: str,
+) -> pd.DataFrame:
+    preferred_xlsx = Path(preferred_xlsx_path)
+    preferred_csv_paths = [
+        Path(preferred_csv_dir) / "Targetable_and_Het_Var.csv",
+        *[
+            Path(fallback_dir) / "Targetable_and_Het_Var.csv"
+            for fallback_dir in VARIANT_CSV_FALLBACK_DIRS
+        ],
+    ]
+    legacy_xlsx = Path(legacy_xlsx_path)
+
+    if preferred_xlsx.exists():
+        return pd.read_excel(preferred_xlsx, sheet_name="Targetable_&_Het_Var")
+    for preferred_csv in preferred_csv_paths:
+        if preferred_csv.exists():
+            return pd.read_csv(preferred_csv)
+    if legacy_xlsx.exists():
+        return pd.read_excel(legacy_xlsx, sheet_name="Targetable_&_Het_Var")
+    return pd.DataFrame()
 
 def load_epi_promoter_gene_flags(csv_path: str) -> pd.DataFrame:
     p = Path(csv_path)
@@ -370,10 +459,13 @@ def build_variant_gene_summary(variant_df: pd.DataFrame) -> pd.DataFrame:
             "EpiSilencing_100_200_Promoter_Variant_Row_Count",
             "EpiSilencing_100_200_Promoter_Unique_Site_Count",
             "Has_EpiSilencing_100_200_Promoter_Variant",
+            "Any_PAM_Filtered",
+            "Any_PrePAM_Only",
         ])
 
     tmp = variant_df.copy()
     tmp["Gene_Symbol"] = tmp["Gene"].astype(str)
+    tmp["Is_PAM_Filtered"] = tmp.get("Is_PAM_Filtered", True).map(normalize_truthy)
     tmp["Variant_Site_Key"] = (
         tmp["Chromosome"].astype(str) + ":" +
         tmp["Position"].astype(str) + ":" +
@@ -393,6 +485,8 @@ def build_variant_gene_summary(variant_df: pd.DataFrame) -> pd.DataFrame:
             EpiSilencing_100_200_Promoter_Variant_Row_Count=(
                 "targetable_epi_silencing_100_200_prom_variant", "sum"
             ),
+            Any_PAM_Filtered=("Is_PAM_Filtered", "max"),
+            Any_PrePAM_Only=("Is_PAM_Filtered", lambda x: (~pd.Series(x).fillna(False).astype(bool)).any()),
         )
         .reset_index()
     )
@@ -697,7 +791,7 @@ def render_summary_heatmap(matrix: pd.DataFrame, title: str, color_title: str, c
     fig.update_layout(height=max(420, 80 * len(matrix.index) + 180))
     fig.update_xaxes(tickangle=-25, automargin=True)
     fig.update_yaxes(automargin=True)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 def build_cell_line_uniqueness_summary(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
@@ -834,7 +928,7 @@ def coerce_variant_df_types(df: pd.DataFrame) -> pd.DataFrame:
     for col in ["Cell_Line", "Editing_Strategy", "Gene", "Chromosome", "Ref_Allele", "Alt_Allele"]:
         if col in df.columns:
             df[col] = df[col].astype(str)
-    return df
+    return normalize_pam_filter_columns(df)
 
 CELL_LINE_LABELS = {
     "KOLF2-ARID2-A02": "KOLF2",
@@ -931,7 +1025,7 @@ def render_pairwise_heatmap(matrix: pd.DataFrame, title: str, color_title: str, 
     )
     fig.update_xaxes(tickangle=-35, automargin=True, tickfont=dict(size=12))
     fig.update_yaxes(automargin=True, tickfont=dict(size=12))
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 def variant_strategy_options(variant_df: pd.DataFrame) -> list:
     if variant_df.empty or "Editing_Strategy" not in variant_df.columns:
@@ -1041,8 +1135,9 @@ def render_bold_dataframe(df_in: pd.DataFrame, use_container_width: bool = True)
     Keep the real dataframe index pinned, while bolding
     column headers and index values as much as Streamlit allows.
     """
+    width = "stretch" if use_container_width else "content"
     if df_in is None or df_in.empty:
-        st.dataframe(df_in, use_container_width=use_container_width)
+        st.dataframe(df_in, width=width)
         return
 
     styler = (
@@ -1055,7 +1150,7 @@ def render_bold_dataframe(df_in: pd.DataFrame, use_container_width: bool = True)
         .map_index(lambda _: "font-weight: 700;", axis=1)   # column headers
     )
 
-    st.dataframe(styler, use_container_width=use_container_width)
+    st.dataframe(styler, width=width)
 
 def render_update_notice():
     st.markdown(
@@ -1070,7 +1165,7 @@ def render_update_notice():
         ">
             <div style="font-weight: 800; margin-bottom: 0.35rem;">2026/04/22 update</div>
             <div>- Addressed dark/light compatibility. Please click the top-right three dots if you want to change to dark, light, or system mode.</div>
-            <div>- This is still showing the results after PAM-filter. I will update the nonPAM filter on <strong>04/30</strong>. Sorry for the delay/inconvenience.</div>
+            <div>- Variant view now supports PAM-filtered and pre-PAM-expanded tables when those files are present in the data folder.</div>
             <div>- This message will disappear if you click <strong>OK</strong>↓.</div>
         </div>
         """,
@@ -1078,7 +1173,7 @@ def render_update_notice():
     )
     dismiss_cols = st.columns([1, 6])
     with dismiss_cols[0]:
-        if st.button("OK", key="dismiss_update_notice", use_container_width=True):
+        if st.button("OK", key="dismiss_update_notice", width="stretch"):
             st.session_state["hide_update_notice"] = True
             st.rerun()
 
@@ -1145,10 +1240,19 @@ def load_data():
         merged["targetable_epi_silencing_100_200_prom"], errors="coerce"
     ).fillna(0).astype(int)
 
-    variant_df = pd.DataFrame()
-    if Path(VARIANT_FILE).exists():
-        variant_df = pd.read_excel(VARIANT_FILE, sheet_name="Targetable_&_Het_Var")
+    variant_df = load_variant_master_table(
+        preferred_xlsx_path=VARIANT_FILE,
+        preferred_csv_dir=VARIANT_CSV_DIR,
+        legacy_xlsx_path=LEGACY_VARIANT_FILE,
+    )
+    if not variant_df.empty:
         variant_df = coerce_variant_df_types(variant_df)
+        if "PAM_Filter_Status" not in variant_df.columns:
+            variant_df["PAM_Filter_Status"] = "PAM-filtered targetable"
+        if "Is_PAM_Filtered" not in variant_df.columns:
+            variant_df["Is_PAM_Filtered"] = True
+        if "Variant_Source" not in variant_df.columns:
+            variant_df["Variant_Source"] = "legacy PAM-only table"
         epi_site_map = load_epi_promoter_site_map(EPI_PROM_SITE_PKL)
         variant_df = annotate_variant_df_with_epi_promoter(variant_df, epi_gene_df, epi_site_map)
 
@@ -1173,7 +1277,7 @@ TUTORIAL_STEPS = [
         "title": "1. Start here",
         "sidebar": "Use the sidebar from top to bottom. Begin broad, then tighten one filter at a time.",
         "body": """
-        This app filters DnD candidate genes by single-cell detectability, gene-level annotations, phenotype evidence, and targetable heterozygous variants. The left sidebar is the control panel. The main page shows the genes and variant records that survive the current settings.
+        This app filters Dominant and Dispensible (D&D) candidate genes by single-cell detectability, gene-level annotations, phenotype evidence, and targetable heterozygous variants. The left sidebar is the control panel. The main page shows the genes and variant records that survive the current settings.
         """,
     },
     {
@@ -1461,12 +1565,13 @@ with st.sidebar.expander("ClinGen Dosage Sensitivity"):
 
 if variant_master_df.empty:
     sidebar_section_title("Variant Filters", 6, 7)
-    st.sidebar.info("Variant table not found at VARIANT_FILE path.")
+    st.sidebar.info("Variant table not found at the configured data paths.")
     selected_variant_cell_lines = []
     selected_variant_strategies = []
     min_pop_freq = 0.0
     var_logic = "OR"
     strat_logic = "OR"
+    pam_scope = "Both PAM-filtered and pre-PAM"
 else:
     variant_cell_lines = sorted(variant_master_df["Cell_Line"].dropna().unique().tolist())
     variant_strategies = variant_strategy_options(variant_master_df)
@@ -1484,6 +1589,12 @@ else:
         0.0,
         step=0.01,
         help="Keep variants with population frequency at or above this value. Variants with missing frequency are retained."
+    )
+
+    pam_scope = st.sidebar.radio(
+        tutorial_label("Targetability Scope", 7),
+        ["Both PAM-filtered and pre-PAM", "PAM-filtered only", "Pre-PAM only"],
+        help="Choose whether to show directly PAM-filtered targetable variants only, pre-PAM-expanded heterozygous/common variants only, or both."
     )
 
     sidebar_section_title("Variant Conditions", 6, 7)
@@ -1726,6 +1837,15 @@ if variant_master_df.empty:
 else:
     filtered_variant_df = variant_master_df.copy()
 
+    if pam_scope == "PAM-filtered only":
+        filtered_variant_df = filtered_variant_df[
+            filtered_variant_df["Is_PAM_Filtered"].fillna(False).astype(bool)
+        ]
+    elif pam_scope == "Pre-PAM only":
+        filtered_variant_df = filtered_variant_df[
+            ~filtered_variant_df["Is_PAM_Filtered"].fillna(False).astype(bool)
+        ]
+
     if selected_variant_cell_lines:
         filtered_variant_df = filtered_variant_df[filtered_variant_df["Cell_Line"].isin(selected_variant_cell_lines)]
     if selected_variant_strategies:
@@ -1822,7 +1942,7 @@ with tabs[1]:
             }
         )
         fig_top_genes.update_xaxes(tickangle=-30)
-        st.plotly_chart(fig_top_genes, use_container_width=True)
+        st.plotly_chart(fig_top_genes, width="stretch")
 
     if include_expression and not base_df.empty:
         fig_hist = px.histogram(
@@ -1840,7 +1960,7 @@ with tabs[1]:
             annotation_text=f"Cutoff: {min_det}%",
             annotation_position="top right"
         )
-        st.plotly_chart(fig_hist, use_container_width=True)
+        st.plotly_chart(fig_hist, width="stretch")
     elif not include_expression:
         st.info("Expression filtering is turned off, so the detectability histogram is hidden.")
     else:
@@ -1898,7 +2018,7 @@ with tabs[2]:
             )
         )
         fig_total_condition.update_xaxes(tickangle=-30)
-        st.plotly_chart(fig_total_condition, use_container_width=True)
+        st.plotly_chart(fig_total_condition, width="stretch")
 
     st.subheader("Variant Position Intersections")
     st.caption(
