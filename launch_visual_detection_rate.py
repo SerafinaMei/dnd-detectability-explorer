@@ -80,6 +80,9 @@ st.markdown("""
 
 CARDIAC_CSV = "data/master_new_cardiac_qc3.csv"
 NEURON_CSV = "data/master_new_neuron_qc3.csv"
+IPSC_HEPATOCYTE_EXPRESSION_CSV = "data/iPSC-liver_expression_stats.csv"
+IPSC_HEPATOCYTE_QC_CSV = "data/iPSC-liver_detection_qc_thresholds.csv"
+IPSC_HEPATOCYTE_QC_PREFIX = "iPSC_Hepatocyte_QC"
 ANNOT_XLSX = "data/genes_other_info.xlsx"
 VARIANT_FILE = "data/pre_pam_variant_table.xlsx"
 LEGACY_VARIANT_FILE = "data/FINAL_Combined_Master_Variant_Table.xlsx"
@@ -112,6 +115,12 @@ BASE_METRICS = [
     "Aggregated_CPM"
 ]
 
+IPSC_HEPATOCYTE_DATASET_LABELS = {
+    "GSE141183": "GSE141183 (2021 day 30)",
+    "GSM5009365": "GSE164417 (2021 day 21, less ideal)",
+    "GSM7903846": "GSE247961 (2025 10x, post-day 21)",
+}
+
 def qc_col(qc_level: str, metric: str) -> str:
     return f"{qc_level}_{metric}"
 
@@ -122,6 +131,129 @@ def add_dataset_label(df: pd.DataFrame, dataset_name: str) -> pd.DataFrame:
     df = df.copy()
     df["Dataset"] = dataset_name
     return df
+
+def normalize_single_qc_expression(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df = df.loc[:, ~df.columns.astype(str).str.startswith("Unnamed:")]
+
+    metric_aliases = {
+        "Detection_Rate_%": "Detection_Rate_%",
+        "Mean_CPM_percell_All": "Mean_Expr_All",
+        "Mean_Log1pCPM_percell_All": "Mean_Expr_All",
+        "Mean_CPM_percell_Only_Detected": "Mean_Expr_Detected",
+        "Mean_Log1pCPM_percell_Only_Detected": "Mean_Expr_Detected",
+        "Aggregated_CPM": "Aggregated_CPM",
+    }
+
+    normalized = df.copy()
+    for source_col, metric_name in metric_aliases.items():
+        if source_col not in normalized.columns:
+            continue
+        for qc_level in QC_LEVELS:
+            normalized[qc_col(qc_level, metric_name)] = normalized[source_col]
+
+    if "Cell_Type" not in normalized.columns:
+        normalized["Cell_Type"] = "iPSC-liver/hepatocyte"
+    if "Source_File" not in normalized.columns:
+        source_cols = [c for c in ["Sample_ID", "Dataset"] if c in normalized.columns]
+        if source_cols:
+            normalized["Source_File"] = normalized[source_cols[0]].astype(str)
+        else:
+            normalized["Source_File"] = "iPSC-liver_expression_stats.csv"
+
+    return normalized
+
+def ipsc_hepatocyte_label(dataset_id) -> str:
+    dataset_id = str(dataset_id)
+    return IPSC_HEPATOCYTE_DATASET_LABELS.get(dataset_id, dataset_id)
+
+def normalize_ipsc_hepatocyte_thresholds(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df = df.loc[:, ~df.columns.astype(str).str.startswith("Unnamed:")]
+    df["QC_Min_Genes"] = pd.to_numeric(df["QC_Min_Genes"], errors="coerce").astype("Int64")
+
+    metric_aliases = {
+        "Detection_Rate_%": "Detection_Rate_%",
+        "Mean_CPM_percell_All": "Mean_Expr_All",
+        "Mean_Log1pCPM_percell_All": "Mean_Expr_All",
+        "Mean_CPM_percell_Only_Detected": "Mean_Expr_Detected",
+        "Mean_Log1pCPM_percell_Only_Detected": "Mean_Expr_Detected",
+        "Aggregated_CPM": "Aggregated_CPM",
+    }
+    available_aliases = {
+        source_col: metric_name
+        for source_col, metric_name in metric_aliases.items()
+        if source_col in df.columns
+    }
+    index_cols = ["Gene_Symbol", "Dataset", "Sample_ID", "Cell_Type", "Replicate"]
+
+    tidy = df[index_cols + ["QC_Min_Genes"] + list(available_aliases)].rename(columns=available_aliases)
+    pivoted = tidy.pivot_table(
+        index=index_cols,
+        columns="QC_Min_Genes",
+        values=sorted(set(available_aliases.values())),
+        aggfunc="first",
+    )
+    pivoted.columns = [
+        f"{IPSC_HEPATOCYTE_QC_PREFIX}_{int(qc_min)}_{metric}"
+        for metric, qc_min in pivoted.columns
+    ]
+    normalized = pivoted.reset_index()
+
+    normalized["Source_Dataset"] = normalized["Dataset"].astype(str)
+    normalized["Source_File"] = normalized["Sample_ID"].astype(str)
+    normalized["Cell_Type"] = "iPSC-liver/hepatocyte"
+    normalized["Detectability_Condition"] = normalized["Source_Dataset"].map(ipsc_hepatocyte_label)
+
+    default_qc_by_level = {
+        "Raw": 0,
+        "LooseQC": 200,
+        "StrongQC": 500,
+    }
+    qc_values = ipsc_hepatocyte_qc_min_gene_options(normalized)
+    for qc_level, default_qc in default_qc_by_level.items():
+        selected_qc = default_qc if default_qc in qc_values else (qc_values[-1] if qc_values else None)
+        if selected_qc is None:
+            continue
+        for metric in BASE_METRICS:
+            source_col = f"{IPSC_HEPATOCYTE_QC_PREFIX}_{selected_qc}_{metric}"
+            if source_col in normalized.columns:
+                normalized[qc_col(qc_level, metric)] = normalized[source_col]
+
+    return normalized
+
+def ipsc_hepatocyte_qc_min_gene_options(df: pd.DataFrame) -> list[int]:
+    prefix = f"{IPSC_HEPATOCYTE_QC_PREFIX}_"
+    suffix = "_Detection_Rate_%"
+    options = []
+    for col in df.columns:
+        if not isinstance(col, str) or not col.startswith(prefix) or not col.endswith(suffix):
+            continue
+        qc_value = col[len(prefix):-len(suffix)]
+        try:
+            options.append(int(qc_value))
+        except ValueError:
+            pass
+    return sorted(set(options))
+
+def load_ipsc_hepatocyte_metrics() -> pd.DataFrame:
+    expression_path = Path(IPSC_HEPATOCYTE_EXPRESSION_CSV)
+    qc_path = Path(IPSC_HEPATOCYTE_QC_CSV)
+
+    if qc_path.exists():
+        liver = pd.read_csv(qc_path)
+        liver = normalize_ipsc_hepatocyte_thresholds(liver)
+    elif expression_path.exists():
+        liver = pd.read_csv(expression_path)
+        liver = normalize_single_qc_expression(liver)
+        if "Dataset" in liver.columns:
+            liver["Source_Dataset"] = liver["Dataset"].astype(str)
+            liver["Cell_Type"] = "iPSC-liver/hepatocyte"
+            liver["Detectability_Condition"] = liver["Source_Dataset"].map(ipsc_hepatocyte_label)
+    else:
+        return pd.DataFrame()
+
+    return add_dataset_label(liver, "liver")
 
 def add_detectability_context(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -139,14 +271,28 @@ def add_detectability_context(df: pd.DataFrame) -> pd.DataFrame:
         df["Developmental_Stage"].notna()
     )
 
-    df["Detectability_Context"] = df["Cell_Type"].astype(str)
+    df["Detectability_Cell_Type"] = df["Dataset"].astype(str)
+    if "Detectability_Condition" not in df.columns:
+        df["Detectability_Condition"] = df["Cell_Type"]
+    else:
+        df["Detectability_Condition"] = df["Detectability_Condition"].fillna(df["Cell_Type"])
+    df["Detectability_Condition"] = df["Detectability_Condition"].astype(str)
+    df["Detectability_Context"] = df["Detectability_Condition"].astype(str)
     df.loc[cardiac_split, "Detectability_Context"] = (
         df.loc[cardiac_split, "Cell_Line"].astype(str) + " " +
         df.loc[cardiac_split, "Developmental_Stage"].astype(str) +
         " cardiomyocytes"
     )
+    df.loc[cardiac_split, "Detectability_Condition"] = (
+        df.loc[cardiac_split, "Cell_Line"].astype(str) + " " +
+        df.loc[cardiac_split, "Developmental_Stage"].astype(str)
+    )
 
     df["Detectability_Context"] = df["Dataset"].astype(str) + " | " + df["Detectability_Context"].astype(str)
+    df["Detectability_Label"] = (
+        df["Detectability_Cell_Type"].astype(str) + " | " +
+        df["Detectability_Condition"].astype(str)
+    )
     return df
 
 def normalize_bool_col(df: pd.DataFrame, col: str) -> pd.Series:
@@ -1163,9 +1309,10 @@ def render_update_notice():
             margin: 0.2rem 0 1rem 0;
             background: color-mix(in srgb, #2f6f73 10%, transparent);
         ">
-            <div style="font-weight: 800; margin-bottom: 0.35rem;">2026/04/22 update</div>
-            <div>- Addressed dark/light compatibility. Please click the top-right three dots if you want to change to dark, light, or system mode.</div>
-            <div>- Variant view now supports PAM-filtered and pre-PAM-expanded tables when those files are present in the data folder.</div>
+            <div style="font-weight: 800; margin-bottom: 0.35rem;">2026/05/19 update</div>
+            <div>- Dominant and Dispensible abbreviation corrected: "DnD" --> "D&D", consistent with the paper.</div>
+            <div>- Variant view now supports PAM-filtered and pre-PAM-expanded tables.</div>
+            <div>- Streamlit app free version automatically put the website to "sleep" after 12 hours of inactivation. I wrote a script to automatically visit the site every 10 hours to keep the site activated.</div>
             <div>- This message will disappear if you click <strong>OK</strong>↓.</div>
         </div>
         """,
@@ -1185,12 +1332,16 @@ def render_update_notice():
 def load_data():
     cardiac = pd.read_csv(CARDIAC_CSV)
     neuron = pd.read_csv(NEURON_CSV)
+    hepatocyte = load_ipsc_hepatocyte_metrics()
     annot = pd.read_excel(ANNOT_XLSX, sheet_name=ANNOT_SHEET)
     clingen_df = load_clingen_dosage_summary(CLINGEN_DOSAGE_CSV)
 
     cardiac = add_dataset_label(cardiac, "Cardiac")
     neuron = add_dataset_label(neuron, "Neuron")
-    metrics_df = pd.concat([cardiac, neuron], ignore_index=True)
+    metrics_parts = [cardiac, neuron]
+    if not hepatocyte.empty:
+        metrics_parts.append(hepatocyte)
+    metrics_df = pd.concat(metrics_parts, ignore_index=True)
     metrics_df = add_detectability_context(metrics_df)
 
     left_key, right_key = pick_annotation_key(metrics_df, annot)
@@ -1264,7 +1415,7 @@ df, variant_master_df, summary_counts_df = load_data()
 # ------------------------------------------------
 # Dashboard UI - Main Header & Info Manual
 # ------------------------------------------------
-st.title("DnD Gene Detectability Explorer")
+st.title("D&D Gene Detectability Explorer")
 
 if "hide_update_notice" not in st.session_state:
     st.session_state["hide_update_notice"] = False
@@ -1292,7 +1443,7 @@ TUTORIAL_STEPS = [
     },
     {
         "title": "3. QC level",
-        "sidebar": "Choose which expression table columns are used: Raw, LooseQC, or StrongQC.",
+        "sidebar": "Choose which expression table columns are used.",
         "body": """
         The Quality Check level selects one matched set of expression columns.
 
@@ -1315,10 +1466,10 @@ TUTORIAL_STEPS = [
         """,
     },
     {
-        "title": "5. Cell Line",
+        "title": "5. Cell Type And Condition",
         "sidebar": "Pick the biological contexts where detectability should be evaluated.",
         "body": """
-        **Cell Line** is the main expression context selector. Cardiac rows are separated by cell line and developmental stage, such as `WTC Day 13 cardiomyocytes` and `SCVI111 Day 30 cardiomyocytes`. Neuron rows appear as their own context.
+        **Cell Type** chooses the broad expression source, such as Cardiac, Neuron, or Liver. **Condition** then chooses the specific cell line, stage, or study context within those sources.
 
         Use **OR** if a gene only needs to pass in any selected context. Use **AND** if a gene must pass in every selected context.
         """,
@@ -1437,7 +1588,7 @@ include_expression = st.sidebar.checkbox(
     help="Uncheck this to explore genes strictly based on Annotations and Variants, ignoring Single-Cell Detectability."
 )
 
-detectability_contexts = sorted(df["Detectability_Context"].dropna().unique().tolist())
+detectability_cell_types = sorted(df["Detectability_Cell_Type"].dropna().unique().tolist())
 
 if include_expression:
     sidebar_section_title("Expression Thresholds", 2, 3)
@@ -1446,8 +1597,10 @@ if include_expression:
         tutorial_label("QC Level", 2),
         QC_LEVELS,
         index=1,
-        help="Choose which Quality-Check-specific expression metrics to use. LooseQC is a good default; StrongQC is stricter."
+        help="Choose which Quality-Check-specific expression metrics to use. Liver(iPSC-Hepatocyte) maps Raw/LooseQC/StrongQC to QC_Min_Genes 0/200/500."
     )
+
+    expression_df = df
 
     det_col = qc_col(qc_level, "Detection_Rate_%")
     mean_all_col = qc_col(qc_level, "Mean_Expr_All")
@@ -1455,7 +1608,7 @@ if include_expression:
     agg_col = qc_col(qc_level, "Aggregated_CPM")
 
     required_cols = [det_col, mean_all_col, mean_detected_col, agg_col]
-    missing_cols = [c for c in required_cols if c not in df.columns]
+    missing_cols = [c for c in required_cols if c not in expression_df.columns]
     if missing_cols:
         st.error(f"Missing expected QC-specific columns: {missing_cols}")
         st.stop()
@@ -1466,7 +1619,7 @@ if include_expression:
         help="Minimum percent of cells in the selected cell line context where this gene has nonzero expression."
     )
 
-    max_agg = float(pd.to_numeric(df[agg_col], errors="coerce").fillna(0).max())
+    max_agg = float(pd.to_numeric(expression_df[agg_col], errors="coerce").fillna(0).max())
     min_cpm = st.sidebar.slider(
         tutorial_label("Min Aggregated CPM", 3),
         0.0,
@@ -1476,7 +1629,7 @@ if include_expression:
         help="Minimum aggregate gene expression across all selected cells, scaled as counts per million total counts."
     )
 
-    max_mean_detected = float(pd.to_numeric(df[mean_detected_col], errors="coerce").fillna(0).max())
+    max_mean_detected = float(pd.to_numeric(expression_df[mean_detected_col], errors="coerce").fillna(0).max())
     min_mean_detected = st.sidebar.slider(
         tutorial_label("Min Mean Expr Detected", 3),
         0.0,
@@ -1488,17 +1641,32 @@ if include_expression:
 
     sidebar_section_title("Expression Conditions", 4)
 
-    selected_contexts = st.sidebar.multiselect(
-        tutorial_label("Cell Line", 4),
-        detectability_contexts,
-        default=detectability_contexts,
-        help="Cardiac entries are split by cell line and developmental stage when those columns are present."
+    selected_cell_types = st.sidebar.multiselect(
+        tutorial_label("Cell Type", 4),
+        detectability_cell_types,
+        default=detectability_cell_types,
+        help="Choose broad expression sources before selecting specific conditions."
     )
 
+    condition_options_df = expression_df[
+        expression_df["Detectability_Cell_Type"].isin(selected_cell_types)
+    ][["Detectability_Label", "Detectability_Context"]].drop_duplicates()
+    condition_options = sorted(condition_options_df["Detectability_Label"].dropna().tolist())
+    label_to_context = dict(
+        zip(condition_options_df["Detectability_Label"], condition_options_df["Detectability_Context"])
+    )
+    selected_condition_labels = st.sidebar.multiselect(
+        tutorial_label("Condition", 4),
+        condition_options,
+        default=condition_options,
+        help="Choose the specific cell line, stage, or study context within the selected cell types."
+    )
+    selected_contexts = [label_to_context[label] for label in selected_condition_labels if label in label_to_context]
+
     expr_logic = st.sidebar.radio(
-        tutorial_label("Match Logic for Cell Lines:", 4),
-        ["OR (Passes thresholds in ANY selected cell line)", "AND (Passes thresholds in ALL selected cell lines)"],
-        help="OR is permissive: a gene can pass in one selected context. AND is strict: a gene must pass in every selected context."
+        tutorial_label("Match Logic for Conditions:", 4),
+        ["OR (Passes thresholds in ANY selected condition)", "AND (Passes thresholds in ALL selected conditions)"],
+        help="OR is permissive: a gene can pass in one selected condition. AND is strict: a gene must pass in every selected condition."
     )
 
 sidebar_section_title("Literature & Genetics", 5)
@@ -1571,7 +1739,7 @@ if variant_master_df.empty:
     min_pop_freq = 0.0
     var_logic = "OR"
     strat_logic = "OR"
-    pam_scope = "Both PAM-filtered and pre-PAM"
+    pam_scope = "Pre-PAM"
 else:
     variant_cell_lines = sorted(variant_master_df["Cell_Line"].dropna().unique().tolist())
     variant_strategies = variant_strategy_options(variant_master_df)
@@ -1593,8 +1761,8 @@ else:
 
     pam_scope = st.sidebar.radio(
         tutorial_label("Targetability Scope", 7),
-        ["Both PAM-filtered and pre-PAM", "PAM-filtered only", "Pre-PAM only"],
-        help="Choose whether to show directly PAM-filtered targetable variants only, pre-PAM-expanded heterozygous/common variants only, or both."
+        ["Pre-PAM", "Post-PAM"],
+        help="Pre-PAM uses the expanded variant universe before PAM filtering. Post-PAM keeps only variants that pass PAM filtering."
     )
 
     sidebar_section_title("Variant Conditions", 6, 7)
@@ -1794,8 +1962,8 @@ filtered_gene_set = set(gene_level_df["Gene_Symbol"].dropna().unique())
 
 # Expression Application
 if include_expression:
-    base_df = df[
-        (df["Detectability_Context"].isin(selected_contexts))
+    base_df = expression_df[
+        (expression_df["Detectability_Context"].isin(selected_contexts))
     ].copy()
 
     for c in [det_col, mean_all_col, mean_detected_col, agg_col]:
@@ -1837,13 +2005,9 @@ if variant_master_df.empty:
 else:
     filtered_variant_df = variant_master_df.copy()
 
-    if pam_scope == "PAM-filtered only":
+    if pam_scope == "Post-PAM":
         filtered_variant_df = filtered_variant_df[
             filtered_variant_df["Is_PAM_Filtered"].fillna(False).astype(bool)
-        ]
-    elif pam_scope == "Pre-PAM only":
-        filtered_variant_df = filtered_variant_df[
-            ~filtered_variant_df["Is_PAM_Filtered"].fillna(False).astype(bool)
         ]
 
     if selected_variant_cell_lines:
@@ -1946,12 +2110,22 @@ with tabs[1]:
 
     if include_expression and not base_df.empty:
         fig_hist = px.histogram(
-            base_df, x=det_col, color="Detectability_Context", nbins=50, barmode="overlay", opacity=0.65,
+            base_df,
+            x=det_col,
+            color="Detectability_Condition",
+            facet_row="Detectability_Cell_Type",
+            nbins=50,
+            barmode="overlay",
+            opacity=0.65,
             title=f"Distribution within Selected Conditions ({qc_level})",
             labels={
                 det_col: f"{qc_level} Detection Rate (%)",
-                "Detectability_Context": "Cell line"
+                "Detectability_Cell_Type": "Cell type",
+                "Detectability_Condition": "Condition",
             }
+        )
+        fig_hist.for_each_annotation(
+            lambda annotation: annotation.update(text=annotation.text.split("=")[-1])
         )
         fig_hist.add_vline(
             x=min_det,

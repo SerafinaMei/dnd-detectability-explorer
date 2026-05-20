@@ -1,0 +1,31 @@
+name: Keep Streamlit App Awake
+
+on:
+  schedule:
+    # Every 10 hours
+    - cron: "0 */10 * * *"
+  workflow_dispatch:
+
+jobs:
+  keep-awake:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Playwright
+        run: |
+          pip install playwright
+          playwright install chromium
+
+      - name: Visit Streamlit app
+        env:
+          STREAMLIT_URL: "https://dnd-detectability-explorer.streamlit.app/"
+        run: |
+          python keep_streamlit_awake.py
