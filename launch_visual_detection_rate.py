@@ -1309,10 +1309,9 @@ def render_update_notice():
             margin: 0.2rem 0 1rem 0;
             background: color-mix(in srgb, #2f6f73 10%, transparent);
         ">
-            <div style="font-weight: 800; margin-bottom: 0.35rem;">2026/05/19 update</div>
-            <div>- Dominant and Dispensible abbreviation corrected: "DnD" --> "D&D", consistent with the paper.</div>
-            <div>- Variant view now supports PAM-filtered and pre-PAM-expanded tables.</div>
-            <div>- Streamlit app free version automatically put the website to "sleep" after 12 hours of inactivation. I wrote a script to automatically visit the site every 10 hours to keep the site activated.</div>
+            <div style="font-weight: 800; margin-bottom: 0.35rem;">2026/05/27 update</div>
+            <div>- Added search bar.</div>
+            <div>- Added alternative expression threshold -- "top n ranked genes".</div>
             <div>- This message will disappear if you click <strong>OK</strong>↓.</div>
         </div>
         """,
@@ -1578,8 +1577,36 @@ def tutorial_label(label, *step_indices):
 # ------------------------------------------------
 # Sidebar Filters
 # ------------------------------------------------
-st.sidebar.title("Apply Filters")
 
+
+
+
+sidebar_section_title("Gene Search")
+gene_search_query = st.sidebar.text_input(
+    "Search",
+    value="",
+    help="Gene symbol search(eg. nefl or NEFL). When provided, the app focuses all outputs on that gene."
+).strip()
+gene_search_norm = normalize_gene_symbol(gene_search_query)
+gene_search_matches = []
+gene_search_active = bool(gene_search_norm)
+if gene_search_active:
+    gene_symbol_lookup = df[["Gene_Symbol"]].dropna().drop_duplicates().copy()
+    gene_symbol_lookup["Gene_Symbol_norm"] = gene_symbol_lookup["Gene_Symbol"].map(normalize_gene_symbol)
+    gene_search_matches = sorted(
+        gene_symbol_lookup.loc[
+            gene_symbol_lookup["Gene_Symbol_norm"].eq(gene_search_norm),
+            "Gene_Symbol"
+        ].astype(str).unique().tolist()
+    )
+    if gene_search_matches:
+        st.sidebar.success(f"Focused on {', '.join(gene_search_matches)}")
+        st.sidebar.caption("Gene search shows all available expression and variant records for this gene.")
+    else:
+        st.sidebar.warning(f"No exact gene symbol match found for '{gene_search_query}'.")
+
+st.sidebar.title("Apply Filters")
+detectability_cell_types = sorted(df["Detectability_Cell_Type"].dropna().unique().tolist())
 
 sidebar_section_title("Expression Toggle", 1)
 include_expression = st.sidebar.checkbox(
@@ -1588,7 +1615,6 @@ include_expression = st.sidebar.checkbox(
     help="Uncheck this to explore genes strictly based on Annotations and Variants, ignoring Single-Cell Detectability."
 )
 
-detectability_cell_types = sorted(df["Detectability_Cell_Type"].dropna().unique().tolist())
 
 if include_expression:
     sidebar_section_title("Expression Thresholds", 2, 3)
@@ -1613,31 +1639,64 @@ if include_expression:
         st.error(f"Missing expected QC-specific columns: {missing_cols}")
         st.stop()
 
-    min_det = st.sidebar.slider(
-        tutorial_label(f"Min Detection Rate (%) [{qc_level}]", 3),
-        0.0, 100.0, 0.0, step=1.0,
-        help="Minimum percent of cells in the selected cell line context where this gene has nonzero expression."
+    expression_filter_mode = st.sidebar.radio(
+        tutorial_label("Expression Filter Mode", 3),
+        ["Manual thresholds", "Top N ranked genes"],
+        help="Manual thresholds use the sliders below. Top N ranks genes within the selected expression conditions."
     )
 
-    max_agg = float(pd.to_numeric(expression_df[agg_col], errors="coerce").fillna(0).max())
-    min_cpm = st.sidebar.slider(
-        tutorial_label("Min Aggregated CPM", 3),
-        0.0,
-        max(0.0, max_agg),
-        0.0,
-        step=max(1.0, max_agg / 100 if max_agg > 100 else 1.0),
-        help="Minimum aggregate gene expression across all selected cells, scaled as counts per million total counts."
-    )
+    min_det = 0.0
+    min_cpm = 0.0
+    min_mean_detected = 0.0
+    top_n_genes = 50
+    expression_rank_basis = "Average percentile from all"
 
-    max_mean_detected = float(pd.to_numeric(expression_df[mean_detected_col], errors="coerce").fillna(0).max())
-    min_mean_detected = st.sidebar.slider(
-        tutorial_label("Min Mean Expr Detected", 3),
-        0.0,
-        max(0.0, max_mean_detected),
-        0.0,
-        step=max(0.01, max_mean_detected / 100 if max_mean_detected > 1 else 0.01),
-        help="Minimum normalized expression among only the cells where this gene is detected."
-    )
+    if expression_filter_mode == "Manual thresholds":
+        min_det = st.sidebar.slider(
+            tutorial_label(f"Min Detection Rate (%) [{qc_level}]", 3),
+            0.0, 100.0, 0.0, step=1.0,
+            help="Minimum percent of cells in the selected cell line context where this gene has nonzero expression."
+        )
+
+        max_agg = float(pd.to_numeric(expression_df[agg_col], errors="coerce").fillna(0).max())
+        min_cpm = st.sidebar.slider(
+            tutorial_label("Min Aggregated CPM", 3),
+            0.0,
+            max(0.0, max_agg),
+            0.0,
+            step=max(1.0, max_agg / 100 if max_agg > 100 else 1.0),
+            help="Minimum aggregate gene expression across all selected cells, scaled as counts per million total counts."
+        )
+
+        max_mean_detected = float(pd.to_numeric(expression_df[mean_detected_col], errors="coerce").fillna(0).max())
+        min_mean_detected = st.sidebar.slider(
+            tutorial_label("Min Mean Expr Detected", 3),
+            0.0,
+            max(0.0, max_mean_detected),
+            0.0,
+            step=max(0.01, max_mean_detected / 100 if max_mean_detected > 1 else 0.01),
+            help="Minimum normalized expression among only the cells where this gene is detected."
+        )
+    else:
+        max_rank_genes = int(expression_df["Gene_Symbol"].dropna().nunique())
+        top_n_genes = st.sidebar.number_input(
+            tutorial_label("Top N Genes", 3),
+            min_value=1,
+            max_value=max(1, max_rank_genes),
+            value=min(50, max(1, max_rank_genes)),
+            step=10,
+            help="Keep the top N genes after ranking expression in the selected conditions."
+        )
+        expression_rank_basis = st.sidebar.selectbox(
+            tutorial_label("Rank Genes By", 3),
+            [
+                "Average percentile from all",
+                "Detection rate",
+                "Aggregated CPM",
+                "Mean expression among detected cells",
+            ],
+            help="You can select to sort genes by one metric only or from the average percentile ranks from the three expression layers."
+        )
 
     sidebar_section_title("Expression Conditions", 4)
 
@@ -1928,7 +1987,8 @@ annot_cols = [
     "ClinGen_TS_Category",
 ]
 available_annot_cols = [c for c in annot_cols if c in df.columns]
-gene_level_df = df[available_annot_cols].drop_duplicates()
+all_gene_level_df = df[available_annot_cols].drop_duplicates()
+gene_level_df = all_gene_level_df.copy()
 
 if "dominant_mutation_count" in gene_level_df.columns:
     gene_level_df = gene_level_df[
@@ -1958,27 +2018,104 @@ if "ClinGen_HI_Score" in gene_level_df.columns:
     gene_level_df = gene_level_df[clingen_score_filter_mask(gene_level_df, "ClinGen_HI_Score", hi_filter_categories)]
 if "ClinGen_TS_Score" in gene_level_df.columns:
     gene_level_df = gene_level_df[clingen_score_filter_mask(gene_level_df, "ClinGen_TS_Score", ts_filter_categories)]
-filtered_gene_set = set(gene_level_df["Gene_Symbol"].dropna().unique())
+
+if gene_search_active:
+    if gene_search_matches:
+        gene_level_df = all_gene_level_df[
+            all_gene_level_df["Gene_Symbol"].map(normalize_gene_symbol).isin(
+                {normalize_gene_symbol(g) for g in gene_search_matches}
+            )
+        ].copy()
+        filtered_gene_set = set(gene_search_matches)
+    else:
+        gene_level_df = all_gene_level_df.iloc[0:0].copy()
+        filtered_gene_set = set()
+else:
+    filtered_gene_set = set(gene_level_df["Gene_Symbol"].dropna().unique())
 
 # Expression Application
 if include_expression:
-    base_df = expression_df[
-        (expression_df["Detectability_Context"].isin(selected_contexts))
-    ].copy()
+    if gene_search_active and gene_search_matches:
+        base_df = expression_df.copy()
+    else:
+        base_df = expression_df[
+            (expression_df["Detectability_Context"].isin(selected_contexts))
+        ].copy()
 
     for c in [det_col, mean_all_col, mean_detected_col, agg_col]:
         base_df[c] = safe_numeric(base_df[c], fill_value=0)
 
-    passed_expr_df = base_df[
-        (base_df[det_col] >= min_det) &
-        (base_df[agg_col] >= min_cpm) &
-        (base_df[mean_detected_col] >= min_mean_detected)
-    ].copy()
-    
-    if expr_logic.startswith("AND") and len(selected_contexts) > 0:
-        gene_context_counts = passed_expr_df.groupby("Gene_Symbol")["Detectability_Context"].nunique()
-        valid_genes = gene_context_counts[gene_context_counts == len(selected_contexts)].index
-        passed_expr_df = passed_expr_df[passed_expr_df["Gene_Symbol"].isin(valid_genes)]
+    if gene_search_active:
+        passed_expr_df = base_df[
+            base_df["Gene_Symbol"].map(normalize_gene_symbol).isin(
+                {normalize_gene_symbol(g) for g in gene_search_matches}
+            )
+        ].copy()
+        passed_expr_df["Expression_Filter_Mode"] = "Gene search"
+    elif expression_filter_mode == "Manual thresholds":
+        passed_expr_df = base_df[
+            (base_df[det_col] >= min_det) &
+            (base_df[agg_col] >= min_cpm) &
+            (base_df[mean_detected_col] >= min_mean_detected)
+        ].copy()
+        
+        if expr_logic.startswith("AND") and len(selected_contexts) > 0:
+            gene_context_counts = passed_expr_df.groupby("Gene_Symbol")["Detectability_Context"].nunique()
+            valid_genes = gene_context_counts[gene_context_counts == len(selected_contexts)].index
+            passed_expr_df = passed_expr_df[passed_expr_df["Gene_Symbol"].isin(valid_genes)]
+        passed_expr_df["Expression_Filter_Mode"] = "Manual thresholds"
+    else:
+        rank_df = base_df.copy()
+        rank_cols = {
+            "Detection rate": det_col,
+            "Aggregated CPM": agg_col,
+            "Mean expression among detected cells": mean_detected_col,
+        }
+        rank_basis_to_percentile_col = {}
+        percentile_cols = []
+        for label, col in rank_cols.items():
+            pct_col = f"{label}_Percentile"
+            rank_df[pct_col] = (
+                rank_df.groupby("Detectability_Context")[col]
+                .rank(method="average", pct=True)
+                .fillna(0)
+            )
+            rank_basis_to_percentile_col[label] = pct_col
+            percentile_cols.append(pct_col)
+
+        if expression_rank_basis == "Average percentile from all":
+            rank_df["Expression_Rank_Score"] = rank_df[percentile_cols].mean(axis=1)
+        else:
+            rank_df["Expression_Rank_Score"] = rank_df[
+                rank_basis_to_percentile_col[expression_rank_basis]
+            ]
+
+        if expr_logic.startswith("AND") and len(selected_contexts) > 0:
+            context_counts = rank_df.groupby("Gene_Symbol")["Detectability_Context"].nunique()
+            complete_genes = context_counts[context_counts == len(selected_contexts)].index
+            rank_df = rank_df[rank_df["Gene_Symbol"].isin(complete_genes)]
+            gene_rank_df = (
+                rank_df.groupby("Gene_Symbol", as_index=False)["Expression_Rank_Score"]
+                .mean()
+            )
+        else:
+            gene_rank_df = (
+                rank_df.groupby("Gene_Symbol", as_index=False)["Expression_Rank_Score"]
+                .max()
+            )
+
+        gene_rank_df = gene_rank_df.sort_values(
+            by=["Expression_Rank_Score", "Gene_Symbol"],
+            ascending=[False, True]
+        ).head(int(top_n_genes)).copy()
+        gene_rank_df["Expression_Rank_Position"] = range(1, len(gene_rank_df) + 1)
+        passed_expr_df = rank_df[rank_df["Gene_Symbol"].isin(gene_rank_df["Gene_Symbol"])].merge(
+            gene_rank_df,
+            how="left",
+            on="Gene_Symbol",
+            suffixes=("", "_Gene")
+        )
+        passed_expr_df["Expression_Filter_Mode"] = expression_rank_basis
         
     filtered_df = passed_expr_df[passed_expr_df["Gene_Symbol"].isin(filtered_gene_set)].copy()
     filtered_gene_set = set(filtered_df["Gene_Symbol"].dropna().unique())
@@ -2005,32 +2142,42 @@ if variant_master_df.empty:
 else:
     filtered_variant_df = variant_master_df.copy()
 
-    if pam_scope == "Post-PAM":
+    if gene_search_active:
+        if gene_search_matches:
+            filtered_variant_df = filtered_variant_df[
+                filtered_variant_df["Gene"].map(normalize_gene_symbol).isin(
+                    {normalize_gene_symbol(g) for g in gene_search_matches}
+                )
+            ]
+        else:
+            filtered_variant_df = filtered_variant_df.iloc[0:0].copy()
+    else:
+        if pam_scope == "Post-PAM":
+            filtered_variant_df = filtered_variant_df[
+                filtered_variant_df["Is_PAM_Filtered"].fillna(False).astype(bool)
+            ]
+
+        if selected_variant_cell_lines:
+            filtered_variant_df = filtered_variant_df[filtered_variant_df["Cell_Line"].isin(selected_variant_cell_lines)]
+        if selected_variant_strategies:
+            filtered_variant_df = apply_variant_strategy_filter(filtered_variant_df, selected_variant_strategies)
+
+        if filtered_gene_set:
+            filtered_variant_df = filtered_variant_df[filtered_variant_df["Gene"].astype(str).isin(filtered_gene_set)]
+        else:
+            filtered_variant_df = filtered_variant_df.iloc[0:0].copy()
+
         filtered_variant_df = filtered_variant_df[
-            filtered_variant_df["Is_PAM_Filtered"].fillna(False).astype(bool)
+            filtered_variant_df["Population_Variant_Frequency"].isna() | 
+            (filtered_variant_df["Population_Variant_Frequency"] >= min_pop_freq)
         ]
 
-    if selected_variant_cell_lines:
-        filtered_variant_df = filtered_variant_df[filtered_variant_df["Cell_Line"].isin(selected_variant_cell_lines)]
-    if selected_variant_strategies:
-        filtered_variant_df = apply_variant_strategy_filter(filtered_variant_df, selected_variant_strategies)
-
-    if filtered_gene_set:
-        filtered_variant_df = filtered_variant_df[filtered_variant_df["Gene"].astype(str).isin(filtered_gene_set)]
-    else:
-        filtered_variant_df = filtered_variant_df.iloc[0:0].copy()
-
-    filtered_variant_df = filtered_variant_df[
-        filtered_variant_df["Population_Variant_Frequency"].isna() | 
-        (filtered_variant_df["Population_Variant_Frequency"] >= min_pop_freq)
-    ]
-
-    if var_logic.startswith("AND") and len(selected_variant_cell_lines) > 0:
+    if not gene_search_active and var_logic.startswith("AND") and len(selected_variant_cell_lines) > 0:
         var_counts = filtered_variant_df.groupby("Gene")["Cell_Line"].nunique()
         valid_var_genes = var_counts[var_counts == len(selected_variant_cell_lines)].index
         filtered_variant_df = filtered_variant_df[filtered_variant_df["Gene"].isin(valid_var_genes)]
 
-    if strat_logic.startswith("AND") and len(selected_variant_strategies) > 0:
+    if not gene_search_active and strat_logic.startswith("AND") and len(selected_variant_strategies) > 0:
         valid_strat_genes = genes_matching_all_variant_strategy_options(
             filtered_variant_df, selected_variant_strategies
         )
@@ -2077,6 +2224,63 @@ with tabs[0]:
 with tabs[1]:
     st.subheader("Gene-level Results")
     st.metric("Genes targetable after all filters", gene_targetable_count)
+
+    if gene_search_active:
+        if gene_search_matches:
+            st.info(f"Searched {', '.join(gene_search_matches)}.")
+        else:
+            st.warning(f"No exact gene symbol match was found for '{gene_search_query}'.")
+
+    if gene_search_active:
+        st.subheader("Gene Annotation")
+        if gene_level_df.empty:
+            st.info("No gene annotation row is available for this search.")
+        else:
+            render_bold_dataframe(gene_level_df.set_index("Gene_Symbol"))
+
+        if include_expression:
+            st.subheader("Expression Records")
+            if filtered_df.empty:
+                st.info("No expression rows are available for this gene.")
+            else:
+                preferred_expr_cols = [
+                    "Gene_Symbol",
+                    "Detectability_Cell_Type",
+                    "Detectability_Condition",
+                    det_col,
+                    agg_col,
+                    mean_all_col,
+                    mean_detected_col,
+                    "Expression_Filter_Mode",
+                ]
+                expr_cols = [c for c in preferred_expr_cols if c in filtered_df.columns]
+                render_bold_dataframe(filtered_df[expr_cols].set_index("Gene_Symbol"))
+
+    if (
+        include_expression
+        and not gene_search_active
+        and expression_filter_mode == "Top N ranked genes"
+        and not filtered_df.empty
+    ):
+        st.subheader("Top Expression-Ranked Genes")
+        rank_score_col = (
+            "Expression_Rank_Score_Gene"
+            if "Expression_Rank_Score_Gene" in filtered_df.columns
+            else "Expression_Rank_Score"
+        )
+        rank_cols = [
+            "Gene_Symbol",
+            "Expression_Rank_Position",
+            rank_score_col,
+            "Expression_Filter_Mode",
+        ]
+        rank_cols = [c for c in rank_cols if c in filtered_df.columns]
+        rank_summary_df = (
+            filtered_df[rank_cols]
+            .drop_duplicates(subset=["Gene_Symbol"])
+            .sort_values("Expression_Rank_Position")
+        )
+        render_bold_dataframe(rank_summary_df.set_index("Gene_Symbol"))
 
     if variant_universe_context_summary.empty:
         st.info("No gene-level variant contexts remain after the current filters.")
@@ -2127,13 +2331,14 @@ with tabs[1]:
         fig_hist.for_each_annotation(
             lambda annotation: annotation.update(text=annotation.text.split("=")[-1])
         )
-        fig_hist.add_vline(
-            x=min_det,
-            line_dash="dash",
-            line_color="red",
-            annotation_text=f"Cutoff: {min_det}%",
-            annotation_position="top right"
-        )
+        if expression_filter_mode == "Manual thresholds":
+            fig_hist.add_vline(
+                x=min_det,
+                line_dash="dash",
+                line_color="red",
+                annotation_text=f"Cutoff: {min_det}%",
+                annotation_position="top right"
+            )
         st.plotly_chart(fig_hist, width="stretch")
     elif not include_expression:
         st.info("Expression filtering is turned off, so the detectability histogram is hidden.")
@@ -2143,6 +2348,26 @@ with tabs[1]:
 with tabs[2]:
     st.subheader("Variant-level Results")
     st.metric("Variants targetable after filtering", variant_targetable_count)
+
+    if gene_search_active:
+        st.subheader("Variant Records")
+        if filtered_variant_df.empty:
+            st.info("No variant rows are available for this gene.")
+        else:
+            preferred_variant_cols = [
+                "Gene",
+                "Cell_Line",
+                "Editing_Strategy",
+                "Chromosome",
+                "Position",
+                "Ref_Allele",
+                "Alt_Allele",
+                "Population_Variant_Frequency",
+                "PAM_Filter_Status",
+                "Variant_Source",
+            ]
+            variant_cols = [c for c in preferred_variant_cols if c in filtered_variant_df.columns]
+            render_bold_dataframe(filtered_variant_df[variant_cols].set_index("Gene"))
 
     if variant_universe_context_summary.empty:
         st.info("No variant-level contexts remain after the current filters.")
