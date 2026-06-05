@@ -96,6 +96,8 @@ EPI_PROM_GENE_CSV = "data/epi_silenceable_100_200_prom.csv"
 EPI_PROM_SITE_PKL = "data/epi_silenceable_100_200_sites.pkl"
 CLINGEN_DOSAGE_CSV = "data/Clingen-Curation-Summary.csv"
 EDITOR_ASSIGNMENT_CSV = "data/master_spreadsheets/editor_assignment_info.csv"
+MERGED_SNP_GENE_MASTER_XLSX = "data/master_spreadsheets/merged_snp_gene_master_updated.xlsx"
+MERGED_HET_CELL_LINES = ["KOLF2", "WTB", "WTC", "WTD", "p47"]
 
 EDITOR_CATEGORY_OPTIONS = [
     "ABE",
@@ -636,6 +638,79 @@ def apply_editor_category_filter(variant_df: pd.DataFrame, selected_categories: 
     if "No editor assignment info" in selected:
         keep = keep | ~variant_df["Editor_Has_Assignment"].fillna(False).astype(bool)
     return variant_df[keep].copy()
+
+
+def load_merged_snp_gene_master(xlsx_path: str) -> pd.DataFrame:
+    path = Path(xlsx_path)
+    if not path.exists():
+        return pd.DataFrame()
+
+    master = pd.read_excel(path)
+    for cell_line in MERGED_HET_CELL_LINES:
+        col = f"Het_in_{cell_line}"
+        if col in master.columns:
+            master[col] = pd.to_numeric(master[col], errors="coerce").fillna(0).astype(int)
+
+    if "editor" in master.columns:
+        editor = master["editor"].astype(str)
+        master["Editor_Has_Assignment"] = master["editor"].notna() & editor.ne("") & editor.ne("nan")
+        master["Editor_ABE"] = editor.eq("ABE")
+        master["Editor_CBE"] = editor.eq("CBE")
+        master["Editor_Both_ABE_CBE"] = editor.eq("both ABE and CBE")
+    else:
+        master["Editor_Has_Assignment"] = False
+        master["Editor_ABE"] = False
+        master["Editor_CBE"] = False
+        master["Editor_Both_ABE_CBE"] = False
+
+    return master
+
+
+def apply_strategy_filter_to_merged_master(master_df: pd.DataFrame, selected_strategies: list) -> pd.DataFrame:
+    if master_df.empty or not selected_strategies or "Het_Editing_Strategies" not in master_df.columns:
+        return master_df
+
+    selected = {str(strategy) for strategy in selected_strategies}
+    keep = pd.Series(False, index=master_df.index)
+    strategy_text = master_df["Het_Editing_Strategies"].fillna("").astype(str)
+    for strategy in selected:
+        if strategy == CRISPROFF_HIGH_CONF_OPTION:
+            keep = keep | strategy_text.str.contains("CRISPRoff", case=False, regex=False)
+        else:
+            keep = keep | strategy_text.str.contains(strategy, case=False, regex=False)
+    return master_df[keep].copy()
+
+
+def filter_merged_master_for_current_sidebar(master_df: pd.DataFrame) -> pd.DataFrame:
+    if master_df.empty:
+        return master_df
+
+    out = master_df.copy()
+    if gene_search_active:
+        if gene_search_matches:
+            out = out[out["gene"].map(normalize_gene_symbol).isin({normalize_gene_symbol(g) for g in gene_search_matches})]
+        else:
+            out = out.iloc[0:0].copy()
+    elif filtered_gene_set:
+        out = out[out["gene"].astype(str).isin(filtered_gene_set)]
+    else:
+        out = out.iloc[0:0].copy()
+
+    if pam_scope == "Post-PAM" and "Het_Is_PAM_Filtered_Any" in out.columns:
+        out = out[pd.to_numeric(out["Het_Is_PAM_Filtered_Any"], errors="coerce").fillna(0).astype(int).eq(1)]
+
+    if selected_editor_categories:
+        out = apply_editor_category_filter(out, selected_editor_categories)
+
+    if selected_variant_strategies:
+        out = apply_strategy_filter_to_merged_master(out, selected_variant_strategies)
+
+    freq_col = "Het_Population_Variant_Frequency_Max" if "Het_Population_Variant_Frequency_Max" in out.columns else "alt allele frequency"
+    if freq_col in out.columns:
+        freq = pd.to_numeric(out[freq_col], errors="coerce")
+        out = out[freq.isna() | (freq >= min_pop_freq)]
+
+    return out
 
 def load_epi_promoter_gene_flags(csv_path: str) -> pd.DataFrame:
     p = Path(csv_path)
@@ -1542,10 +1617,11 @@ def load_data():
         editor_summary_df = load_editor_assignment_summary(EDITOR_ASSIGNMENT_CSV)
         variant_df = add_editor_annotations_to_variants(variant_df, editor_summary_df)
 
+    merged_snp_gene_master_df = load_merged_snp_gene_master(MERGED_SNP_GENE_MASTER_XLSX)
     summary_df = load_optional_summary(SUMMARY_TSV)
-    return merged, variant_df, summary_df
+    return merged, variant_df, summary_df, merged_snp_gene_master_df
 
-df, variant_master_df, summary_counts_df = load_data()
+df, variant_master_df, summary_counts_df, merged_snp_gene_master_df = load_data()
 
 # ------------------------------------------------
 # Dashboard UI - Main Header & Info Manual
@@ -2617,28 +2693,40 @@ with tabs[2]:
 with tabs[3]:
     st.subheader("Cell-line Intersections")
     st.caption(
-        "Venn diagrams show exact intersections between selected variant cell lines after the current sidebar filters."
+        "Venn diagrams use merged_snp_gene_master_updated.xlsx and the Het_in_* columns for cell-line membership."
     )
 
-    if filtered_variant_df.empty:
-        st.info("No variant rows are available for cell-line intersections after the current filters.")
+    if merged_snp_gene_master_df.empty:
+        st.info("merged_snp_gene_master_updated.xlsx was not found or could not be loaded.")
     else:
         venn_item_type = st.radio(
             "Intersection item",
-            ["Variant positions", "Genes"],
+            ["SNPs", "gRNAs"],
             horizontal=True,
             key="cell_line_venn_item_type",
         )
-        venn_df = add_variant_site_key(filtered_variant_df)
-        set_value_col = "Variant_Site_Key" if venn_item_type == "Variant positions" else "Gene"
+
+        venn_master_df = filter_merged_master_for_current_sidebar(merged_snp_gene_master_df)
+        set_value_col = "snp" if venn_item_type == "SNPs" else "gRNA"
+        selected_display_lines = {prettify_cell_line(str(line)) for line in selected_variant_cell_lines}
+        cell_lines_for_venn = [line for line in MERGED_HET_CELL_LINES if not selected_display_lines or line in selected_display_lines]
+
         venn_sets = {}
-        for cell_line in sorted(venn_df["Cell_Line"].dropna().astype(str).unique().tolist()):
-            values = set(venn_df.loc[venn_df["Cell_Line"].astype(str) == cell_line, set_value_col].dropna().astype(str))
+        for cell_line in cell_lines_for_venn:
+            het_col = f"Het_in_{cell_line}"
+            if het_col not in venn_master_df.columns or set_value_col not in venn_master_df.columns:
+                continue
+            values = set(
+                venn_master_df.loc[
+                    pd.to_numeric(venn_master_df[het_col], errors="coerce").fillna(0).astype(int).eq(1),
+                    set_value_col,
+                ].dropna().astype(str)
+            )
             if values:
-                venn_sets[prettify_cell_line(cell_line)] = values
+                venn_sets[cell_line] = values
 
         if len(venn_sets) < 2:
-            st.info("At least two cell lines are needed for a Venn diagram.")
+            st.info("At least two selected cell lines with values are needed for a Venn diagram.")
         elif len(venn_sets) > 6:
             st.info("The Venn plot supports up to six sets; reduce the selected cell lines.")
         else:
@@ -2652,13 +2740,13 @@ with tabs[3]:
                 legend_loc=None,
                 ax=ax_venn,
             )
-            ax_venn.set_title(f"Cell-line intersections: {venn_item_type}")
+            ax_venn.set_title(f"Five-cell-line Venn diagram: {venn_item_type}")
             label_positions_by_n = {
                 2: [(0.15, 0.83), (0.78, 0.83)],
                 3: [(0.12, 0.82), (0.78, 0.82), (0.48, 0.08)],
                 4: [(0.0, 0.75), (0.28, 0.95), (0.65, 0.95), (0.88, 0.75)],
                 5: [(0.0, 0.55), (0.37, 0.93), (0.88, 0.71), (0.78, 0.08), (0.18, 0.05)],
-                #6: [(0.05, 0.75), (0.30, 0.97), (0.68, 0.97), (0.92, 0.75), (0.70, 0.08), (0.22, 0.08)],
+                6: [(0.05, 0.75), (0.30, 0.97), (0.68, 0.97), (0.92, 0.75), (0.70, 0.08), (0.22, 0.08)],
             }
             for label, (x, y) in zip(venn_sets.keys(), label_positions_by_n.get(len(venn_sets), [])):
                 ax_venn.text(x, y, label, transform=ax_venn.transAxes, fontsize=12)
